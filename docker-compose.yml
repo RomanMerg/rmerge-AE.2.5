@@ -16,13 +16,7 @@ services:
       timeout: 5s
       retries: 5
 
-  ollama:
-    image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
+  # Ollama intentionally omitted — use the existing host ollama container at localhost:11434
 
 volumes:
   postgres_data:
-  ollama_data:
