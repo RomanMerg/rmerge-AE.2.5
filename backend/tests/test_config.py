@@ -65,3 +65,11 @@ def test_settings_missing_required_field_raises():
         if key is not None:
             os.environ["OPENROUTER_API_KEY"] = key
         get_settings.cache_clear()
+
+
+def test_db_module_imports_and_engine_exists():
+    """Engine construction from a valid DATABASE_URL format must not raise."""
+    from app.db import AsyncSessionLocal, engine  # noqa: F401 — import is the assertion
+
+    assert engine is not None
+    assert AsyncSessionLocal is not None
