@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+.env
+.env.local
+*.egg-info/
+dist/
+build/
+
+# uv
+.python-version
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+.vercel/
+
+# Environment files — never commit secrets
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test / coverage
+.pytest_cache/
+htmlcov/
+.coverage
+
+# ChromaDB (if used locally)
+chroma_db/
