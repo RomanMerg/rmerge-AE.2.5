@@ -10,6 +10,10 @@ dependencies = [
     "asyncpg>=0.30.0",
     "pydantic-settings>=2.6.0",
     "python-dotenv>=1.0.0",
+    "openai>=2.44.0",
+    "beautifulsoup4>=4.15.0",
+    "tiktoken>=0.13.0",
+    "httpx>=0.28.1",
 ]
 
 [tool.uv]
