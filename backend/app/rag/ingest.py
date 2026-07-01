@@ -4,6 +4,7 @@ from pathlib import Path
 
 from openai import AsyncOpenAI
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from app.config import get_settings
 from app.db import AsyncSessionLocal
@@ -35,7 +36,13 @@ async def embed_text(content: str) -> list[float]:
         input=content,
         model=settings.embedding_model,
     )
-    return response.data[0].embedding
+    embedding = response.data[0].embedding
+    if len(embedding) != 1536:
+        raise ValueError(
+            f"Expected 1536-dim embedding from text-embedding-3-small, got {len(embedding)}. "
+            "Check EMBEDDING_MODEL config."
+        )
+    return embedding
 
 
 async def _upsert_document(
@@ -56,21 +63,25 @@ async def _upsert_document(
         ).fetchone()
 
         if row is None:
-            await session.execute(
-                text(
-                    "INSERT INTO documents (title, content, embedding, metadata, content_hash) "
-                    "VALUES (:title, :content, CAST(:embedding AS vector), CAST(:metadata AS jsonb), :hash)"
-                ),
-                {
-                    "title": title,
-                    "content": content,
-                    "embedding": vector_str,
-                    "metadata": json.dumps(metadata),
-                    "hash": content_hash,
-                },
-            )
-            await session.commit()
-            return "inserted"
+            try:
+                await session.execute(
+                    text(
+                        "INSERT INTO documents (title, content, embedding, metadata, content_hash) "
+                        "VALUES (:title, :content, CAST(:embedding AS vector), CAST(:metadata AS jsonb), :hash)"
+                    ),
+                    {
+                        "title": title,
+                        "content": content,
+                        "embedding": vector_str,
+                        "metadata": json.dumps(metadata),
+                        "hash": content_hash,
+                    },
+                )
+                await session.commit()
+                return "inserted"
+            except IntegrityError:
+                await session.rollback()
+                return "skipped"
 
         if row.content_hash == content_hash:
             return "skipped"

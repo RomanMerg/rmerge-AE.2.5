@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 
 # --- Unit tests (no DB, no API) ---
@@ -111,6 +112,35 @@ async def test_ingest_static_kb_returns_summary_dict():
     assert "skipped" in result
     assert isinstance(result["ingested"], int)
     assert isinstance(result["skipped"], int)
+
+
+@pytest.mark.asyncio
+async def test_upsert_document_returns_skipped_on_integrity_error():
+    """_upsert_document returns 'skipped' and rolls back when INSERT raises IntegrityError."""
+    from app.rag.ingest import _upsert_document
+
+    mock_session = AsyncMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+
+    # SELECT returns None (no existing row), then INSERT raises IntegrityError
+    mock_select_result = MagicMock()
+    mock_select_result.fetchone.return_value = None
+    mock_session.execute = AsyncMock(
+        side_effect=[mock_select_result, IntegrityError("content_hash collision", None, None)]
+    )
+
+    with patch("app.rag.ingest.AsyncSessionLocal", return_value=mock_session):
+        result = await _upsert_document(
+            title="Test Doc",
+            content="some content",
+            embedding=[0.1] * 1536,
+            metadata={"source": "static"},
+            content_hash="abc123",
+        )
+
+    assert result == "skipped"
+    mock_session.rollback.assert_called_once()
 
 
 # --- Retriever unit tests ---

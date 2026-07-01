@@ -17,7 +17,9 @@ CREATE TABLE IF NOT EXISTS documents (
     content      TEXT        NOT NULL,
     embedding    VECTOR(1536),             -- dimensions match text-embedding-3-small
     metadata     JSONB       NOT NULL DEFAULT '{}',  -- source, fetched_at, use_case etc.
-    content_hash TEXT        UNIQUE        -- sha256 of content; enables idempotent re-ingest
+    content_hash TEXT        UNIQUE,       -- sha256 of content; enables idempotent re-ingest
+    -- On existing DBs run: ALTER TABLE documents ADD UNIQUE (title);
+    UNIQUE (title)
 );
 
 -- IVFFlat index for approximate cosine similarity search
