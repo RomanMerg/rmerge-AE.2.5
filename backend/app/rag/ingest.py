@@ -59,7 +59,7 @@ async def _upsert_document(
             await session.execute(
                 text(
                     "INSERT INTO documents (title, content, embedding, metadata, content_hash) "
-                    "VALUES (:title, :content, :embedding::vector, :metadata::jsonb, :hash)"
+                    "VALUES (:title, :content, CAST(:embedding AS vector), CAST(:metadata AS jsonb), :hash)"
                 ),
                 {
                     "title": title,
@@ -77,8 +77,8 @@ async def _upsert_document(
 
         await session.execute(
             text(
-                "UPDATE documents SET content=:content, embedding=:embedding::vector, "
-                "metadata=:metadata::jsonb, content_hash=:hash WHERE id=:id"
+                "UPDATE documents SET content=:content, embedding=CAST(:embedding AS vector), "
+                "metadata=CAST(:metadata AS jsonb), content_hash=:hash WHERE id=:id"
             ),
             {
                 "content": content,

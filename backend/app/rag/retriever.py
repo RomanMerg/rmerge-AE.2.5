@@ -10,9 +10,9 @@ async def search_documents(query_embedding: list[float], top_k: int = 2) -> list
         result = await session.execute(
             text(
                 "SELECT title, content, metadata, "
-                "1 - (embedding <=> :embedding::vector) AS similarity "
+                "1 - (embedding <=> CAST(:embedding AS vector)) AS similarity "
                 "FROM documents "
-                "ORDER BY embedding <=> :embedding::vector "
+                "ORDER BY embedding <=> CAST(:embedding AS vector) "
                 "LIMIT :top_k"
             ),
             {"embedding": vector_str, "top_k": top_k},
