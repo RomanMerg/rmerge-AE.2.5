@@ -182,3 +182,119 @@ async def test_search_documents_result_has_expected_keys():
 
     assert len(results) == 1
     assert set(results[0].keys()) == {"title", "content", "metadata", "similarity"}
+
+
+# --- Live ingester unit tests ---
+
+def test_chunk_text_single_chunk_when_below_limit():
+    """Text shorter than max_tokens is returned as a single chunk."""
+    from app.rag.live_ingester import chunk_text
+
+    short_text = "This is a short text."
+    chunks = chunk_text(short_text, max_tokens=800, overlap=100)
+    assert len(chunks) == 1
+    assert chunks[0] == short_text
+
+
+def test_chunk_text_splits_long_text():
+    """Text exceeding max_tokens is split into multiple chunks."""
+    from app.rag.live_ingester import chunk_text
+
+    # Generate ~1600 tokens worth of text (approx 1 token per 4 chars, so ~6400 chars)
+    long_text = "word " * 2000  # ~2000 tokens
+    chunks = chunk_text(long_text, max_tokens=800, overlap=100)
+    assert len(chunks) >= 2
+
+
+def test_chunk_text_chunks_overlap():
+    """Successive chunks share overlap_tokens tokens at their boundary."""
+    from app.rag.live_ingester import chunk_text
+
+    long_text = "word " * 2000
+    chunks = chunk_text(long_text, max_tokens=800, overlap=100)
+    # The end of chunk[0] should share content with the start of chunk[1]
+    # (not a perfect test but confirms chunks are not disjoint)
+    assert len(chunks) >= 2
+    # Verify total unique content is less than sum of chunk sizes (overlap exists)
+    total_chars = sum(len(c) for c in chunks)
+    original_chars = len(long_text)
+    assert total_chars > original_chars  # overlap means total > original
+
+
+def test_strip_html_removes_nav_and_footer():
+    from app.rag.live_ingester import strip_html
+
+    html = """
+    <html><body>
+    <nav>Nav content here</nav>
+    <main><p>Useful content here</p></main>
+    <footer>Footer stuff</footer>
+    </body></html>
+    """
+    result = strip_html(html)
+    assert "Nav content here" not in result
+    assert "Footer stuff" not in result
+    assert "Useful content here" in result
+
+
+def test_strip_html_returns_plain_text():
+    from app.rag.live_ingester import strip_html
+
+    html = "<p>Hello <b>world</b></p>"
+    result = strip_html(html)
+    assert "<" not in result
+    assert "Hello" in result
+    assert "world" in result
+
+
+@pytest.mark.asyncio
+async def test_ingest_live_docs_fetches_each_source():
+    """ingest_live_docs makes an HTTP GET for each configured source URL."""
+    from app.rag import live_ingester
+
+    fake_html = "<html><body><main><p>" + ("word " * 100) + "</p></main></body></html>"
+    source_count = len(live_ingester.LIVE_SOURCES)
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.text = fake_html
+
+    with (
+        patch.object(live_ingester, "embed_text", new=AsyncMock(return_value=[0.1] * 1536)),
+        patch.object(live_ingester, "_upsert_document", new=AsyncMock(return_value="inserted")),
+        patch("httpx.AsyncClient") as mock_client_cls,
+    ):
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client_cls.return_value = mock_client
+
+        result = await live_ingester.ingest_live_docs()
+
+    assert mock_client.get.call_count == source_count
+    assert "ingested" in result
+    assert "skipped" in result
+    assert "errors" in result
+
+
+@pytest.mark.asyncio
+async def test_ingest_live_docs_handles_fetch_error_gracefully():
+    """A network error on one source does not abort the whole run."""
+    from app.rag import live_ingester
+
+    with (
+        patch.object(live_ingester, "embed_text", new=AsyncMock(return_value=[0.1] * 1536)),
+        patch.object(live_ingester, "_upsert_document", new=AsyncMock(return_value="inserted")),
+        patch("httpx.AsyncClient") as mock_client_cls,
+    ):
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(side_effect=Exception("network error"))
+        mock_client_cls.return_value = mock_client
+
+        result = await live_ingester.ingest_live_docs()
+
+    assert result["errors"] > 0
+    assert result["ingested"] == 0
