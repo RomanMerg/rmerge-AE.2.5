@@ -37,6 +37,11 @@ pytestmark = pytest.mark.integration
 async def skip_if_no_db():
     if not await _db_available():
         pytest.skip("Postgres not available — run: docker compose up -d postgres")
+    yield
+    # Dispose the connection pool so asyncpg coroutine warnings from one test
+    # do not leave the pool in a broken state that causes the next test to skip.
+    from app.db import engine
+    await engine.dispose()
 
 
 @pytest.fixture
@@ -77,7 +82,7 @@ async def test_ingest_and_retrieve_similarity_above_threshold(clean_test_docs):
         await session.execute(
             text(
                 "INSERT INTO documents (title, content, embedding, metadata, content_hash) "
-                "VALUES (:title, :content, :embedding::vector, :metadata::jsonb, :hash)"
+                "VALUES (:title, :content, CAST(:embedding AS vector), CAST(:metadata AS jsonb), :hash)"
             ),
             {
                 "title": doc_title,
@@ -122,7 +127,7 @@ async def test_retriever_returns_most_similar_first(clean_test_docs):
             await session.execute(
                 text(
                     "INSERT INTO documents (title, content, embedding, metadata, content_hash) "
-                    "VALUES (:title, :content, :embedding::vector, :metadata::jsonb, :hash)"
+                    "VALUES (:title, :content, CAST(:embedding AS vector), CAST(:metadata AS jsonb), :hash)"
                 ),
                 {
                     "title": title,

@@ -7,6 +7,9 @@ async def search_documents(query_embedding: list[float], top_k: int = 2) -> list
     """Return the top_k documents most similar to query_embedding (cosine similarity)."""
     vector_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
     async with AsyncSessionLocal() as session:
+        # Probe all ivfflat lists to guarantee full recall on small datasets.
+        # In production with many docs, lower this to ~10% of the lists value for speed.
+        await session.execute(text("SET LOCAL ivfflat.probes = 10"))
         result = await session.execute(
             text(
                 "SELECT title, content, metadata, "
