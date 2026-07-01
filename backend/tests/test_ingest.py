@@ -111,3 +111,74 @@ async def test_ingest_static_kb_returns_summary_dict():
     assert "skipped" in result
     assert isinstance(result["ingested"], int)
     assert isinstance(result["skipped"], int)
+
+
+# --- Retriever unit tests ---
+
+@pytest.mark.asyncio
+async def test_search_documents_returns_list():
+    """search_documents returns a list (may be empty if DB is empty or unavailable)."""
+    from app.rag.retriever import search_documents
+
+    query_embedding = [0.1] * 1536
+
+    with patch("app.rag.retriever.AsyncSessionLocal") as mock_session_cls:
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session_cls.return_value = mock_session
+
+        mock_result = MagicMock()
+        mock_result.mappings.return_value.all.return_value = []
+        mock_session.execute = AsyncMock(return_value=mock_result)
+
+        results = await search_documents(query_embedding, top_k=2)
+
+    assert isinstance(results, list)
+
+
+@pytest.mark.asyncio
+async def test_search_documents_passes_correct_top_k():
+    """search_documents passes top_k to the SQL query."""
+    from app.rag.retriever import search_documents
+
+    query_embedding = [0.0] * 1536
+
+    with patch("app.rag.retriever.AsyncSessionLocal") as mock_session_cls:
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session_cls.return_value = mock_session
+
+        mock_result = MagicMock()
+        mock_result.mappings.return_value.all.return_value = []
+        mock_session.execute = AsyncMock(return_value=mock_result)
+
+        await search_documents(query_embedding, top_k=5)
+
+    call_kwargs = mock_session.execute.call_args[0][1]
+    assert call_kwargs["top_k"] == 5
+
+
+@pytest.mark.asyncio
+async def test_search_documents_result_has_expected_keys():
+    """Each result dict has title, content, metadata, similarity keys."""
+    from app.rag.retriever import search_documents
+
+    query_embedding = [0.1] * 1536
+    fake_row = {"title": "T", "content": "C", "metadata": {}, "similarity": 0.9}
+
+    with patch("app.rag.retriever.AsyncSessionLocal") as mock_session_cls:
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session_cls.return_value = mock_session
+
+        mock_result = MagicMock()
+        mock_result.mappings.return_value.all.return_value = [fake_row]
+        mock_session.execute = AsyncMock(return_value=mock_result)
+
+        results = await search_documents(query_embedding, top_k=1)
+
+    assert len(results) == 1
+    assert set(results[0].keys()) == {"title", "content", "metadata", "similarity"}
