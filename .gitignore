@@ -39,3 +39,7 @@ htmlcov/
 
 # ChromaDB (if used locally)
 chroma_db/
+
+# Development planning artifacts (local only)
+.superpowers/
+docs/superpowers/
