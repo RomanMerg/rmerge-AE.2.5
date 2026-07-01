@@ -15,7 +15,7 @@ def compute_content_hash(content: str) -> str:
 
 def load_kb_files(kb_dir: Path | None = None) -> list[dict]:
     if kb_dir is None:
-        kb_dir = Path(__file__).parent.parent.parent.parent / "knowledge_base"
+        kb_dir = Path(__file__).parent.parent.parent / "knowledge_base"
     docs = []
     for md_file in sorted(kb_dir.glob("*.md")):
         content = md_file.read_text(encoding="utf-8")
