@@ -17,6 +17,7 @@ dependencies = [
     "fastmcp>=2.0",
     "langchain-openai>=0.3.0",
     "langchain-core>=0.3.0",
+    "gradio>=4.0",
 ]
 
 [tool.uv]
