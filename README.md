@@ -199,6 +199,8 @@ uv run python -m uvicorn app.main:app --reload --port 8000
 
 # Run the Gradio demo (separate terminal)
 uv run python frontend/app.py
+# If port 8000 is already taken locally, run the backend on another port and point
+# the demo at it: BACKEND_API_URL=http://localhost:8001 uv run python frontend/app.py
 ```
 
 API at `http://localhost:8000` (docs at `/docs`), Gradio demo at `http://localhost:7860`.
