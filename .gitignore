@@ -40,6 +40,5 @@ htmlcov/
 # ChromaDB (if used locally)
 chroma_db/
 
-# Development planning artifacts (local only)
+# Superpowers SDD scratch (task briefs, reports, review diffs) — regenerated per session, not source of truth
 .superpowers/
-docs/superpowers/
