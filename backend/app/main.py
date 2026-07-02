@@ -219,9 +219,9 @@ async def chat(body: ChatRequest) -> ChatResponse:
             )
 
         final_message = await llm.ainvoke(messages)
-        reply = final_message.content
+        reply = final_message.content or "I've made a note of that — could you tell me more?"
     else:
-        reply = ai_message.content
+        reply = ai_message.content or "Could you tell me more about what you're looking to automate?"
 
     new_history = history + [
         {"role": "user", "content": body.message},

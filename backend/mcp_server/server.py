@@ -1,6 +1,6 @@
 """
 FastMCP server exposing the capture_lead tool.
-Wraps Twenty CRM REST API to create a Person record.
+Wraps Twenty CRM's REST API (/rest/...) to create a Person record and link a note to it.
 
 Run with:
     uv run python -m mcp_server.server
@@ -14,7 +14,7 @@ from fastmcp import FastMCP
 
 mcp = FastMCP("automate-this-lead-capture")
 
-TWENTY_BASE_URL = os.getenv("TWENTY_BASE_URL", "http://localhost:3000")
+TWENTY_BASE_URL = os.getenv("TWENTY_BASE_URL", "http://localhost:3001")
 TWENTY_API_KEY = os.getenv("TWENTY_API_KEY", "")
 
 
@@ -48,14 +48,13 @@ async def capture_lead(
     payload = {
         "name": {"firstName": first, "lastName": last},
         "emails": {"primaryEmail": email},
-        "company": {"name": company},
         "jobTitle": "SMB Owner",
     }
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resp = await client.post(
-                f"{TWENTY_BASE_URL}/api/object/people",
+                f"{TWENTY_BASE_URL}/rest/people",
                 json=payload,
                 headers=headers,
             )
@@ -68,16 +67,24 @@ async def capture_lead(
             return {"status": "error", "detail": str(e)}
 
         try:
-            # Best-effort: a failed note shouldn't erase a successful Person creation.
-            await client.post(
-                f"{TWENTY_BASE_URL}/api/object/notes",
+            # Best-effort: a failed note (or link) shouldn't erase a successful Person creation.
+            note_resp = await client.post(
+                f"{TWENTY_BASE_URL}/rest/notes",
                 json={
                     "title": f"Automation pain point — {company}",
-                    "body": pain_point,
-                    "noteTargets": [{"personId": person_id}] if person_id != "unknown" else [],
+                    "bodyV2": {"markdown": pain_point},
                 },
                 headers=headers,
             )
+            note_resp.raise_for_status()
+            note_id = note_resp.json().get("data", {}).get("createNote", {}).get("id")
+
+            if note_id and person_id != "unknown":
+                await client.post(
+                    f"{TWENTY_BASE_URL}/rest/noteTargets",
+                    json={"noteId": note_id, "targetPersonId": person_id},
+                    headers=headers,
+                )
         except Exception:
             pass
 

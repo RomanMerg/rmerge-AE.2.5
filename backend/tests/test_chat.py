@@ -284,3 +284,27 @@ async def test_chat_capture_lead_error_result_does_not_crash():
         )
 
     assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_chat_empty_llm_content_falls_back_to_default_reply():
+    """If the LLM returns empty content after a tool call, a non-empty fallback reply is used."""
+    mock_session = _mock_db_session(row=None)
+    tool_call = {
+        "name": "capture_lead",
+        "args": {"name": "Jane", "email": "jane@x.com", "company": "X Co", "pain_point": "x"},
+        "id": "call_5",
+    }
+    first_msg = _make_ai_message(content=None, tool_calls=[tool_call])
+    second_msg = _make_ai_message(content="")
+
+    with (
+        patch("app.main.AsyncSessionLocal", return_value=mock_session),
+        patch("app.main.ChatOpenAI") as mock_chat_cls,
+        patch("app.main.capture_lead", new=AsyncMock(return_value={"status": "created", "person_id": "1"})),
+    ):
+        _configure_mock_llm(mock_chat_cls, [first_msg, second_msg])
+        response = await _post_chat({"message": "My name is Jane, email jane@x.com, I run X Co, x"})
+
+    assert response.status_code == 200
+    assert response.json()["reply"] != ""
