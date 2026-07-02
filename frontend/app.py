@@ -41,6 +41,12 @@ def chat(message: str, history: list) -> tuple[str, list]:
         return f"Connection error: {e}", history
 
 
+def new_conversation():
+    global session_id
+    session_id = str(uuid.uuid4())
+    return []
+
+
 with gr.Blocks(title="Automate This — SMB Advisor") as demo:
     gr.Markdown("# Automate This\nDescribe a repetitive task your business does manually. I'll tell you how to automate it.")
     chatbot = gr.Chatbot(height=500)
@@ -48,7 +54,7 @@ with gr.Blocks(title="Automate This — SMB Advisor") as demo:
     clear = gr.Button("New conversation")
 
     msg.submit(chat, [msg, chatbot], [msg, chatbot])
-    clear.click(lambda: (str(uuid.uuid4()), []), outputs=[gr.State(), chatbot])
+    clear.click(new_conversation, outputs=[chatbot])
 
 if __name__ == "__main__":
     demo.launch(server_port=7860)
