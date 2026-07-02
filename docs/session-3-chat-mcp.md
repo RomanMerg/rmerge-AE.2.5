@@ -1,5 +1,13 @@
 # Session 3 — Chat Endpoint + Lead Capture MCP Server
 
+> **SUPERSEDED for Tasks 3-5.** This plan's Task 1 (`/chat`) and Task 2 (`capture_lead` MCP server) were built
+> as written below, but Tasks 3-5 were replaced before execution: this plan's chat flow only reaches 1
+> LLM-callable tool with no LangChain, short of this project's sprint requirements (≥3 tool calls,
+> LangChain+OpenRouter). The executed continuation is
+> [`docs/superpowers/plans/2026-07-02-session-3-tools-langchain.md`](superpowers/plans/2026-07-02-session-3-tools-langchain.md),
+> which adds `calculate_roi` + `search_automation_patterns`, retrofits `/chat` to LangChain, and fixes real
+> Twenty CRM API bugs found via live testing. Read that file for the actual final architecture.
+
 **Project:** Automate This — SMB Automation Advisor  
 **Repo:** `C:\Users\markm\Documents\Claude\Projects\Turing\rmerge-AE.2.5`  
 **Date:** 2026-07-02  
