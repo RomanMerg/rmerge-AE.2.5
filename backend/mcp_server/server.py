@@ -62,8 +62,13 @@ async def capture_lead(
             resp.raise_for_status()
             data = resp.json()
             person_id = data.get("data", {}).get("createPerson", {}).get("id", "unknown")
+        except httpx.HTTPStatusError as e:
+            return {"status": "error", "detail": str(e)}
+        except Exception as e:
+            return {"status": "error", "detail": str(e)}
 
-            # Also log the pain point as a note
+        try:
+            # Best-effort: a failed note shouldn't erase a successful Person creation.
             await client.post(
                 f"{TWENTY_BASE_URL}/api/object/notes",
                 json={
@@ -73,11 +78,10 @@ async def capture_lead(
                 },
                 headers=headers,
             )
-            return {"status": "created", "person_id": person_id}
-        except httpx.HTTPStatusError as e:
-            return {"status": "error", "detail": str(e)}
-        except Exception as e:
-            return {"status": "error", "detail": str(e)}
+        except Exception:
+            pass
+
+        return {"status": "created", "person_id": person_id}
 
 
 if __name__ == "__main__":

@@ -108,3 +108,27 @@ def test_capture_lead_splits_single_word_name_correctly():
 
     assert first == "Cher"
     assert last == ""
+
+
+@pytest.mark.asyncio
+async def test_capture_lead_note_failure_does_not_mask_person_creation():
+    """If note creation fails after Person creation succeeds, status is still 'created'."""
+    from mcp_server.server import capture_lead
+
+    mock_person_response = MagicMock()
+    mock_person_response.raise_for_status = MagicMock()
+    mock_person_response.json.return_value = {"data": {"createPerson": {"id": "person-123"}}}
+
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        # First POST (people) succeeds, second POST (notes) raises
+        mock_client.post = AsyncMock(side_effect=[mock_person_response, Exception("notes endpoint down")])
+        mock_client_cls.return_value = mock_client
+
+        result = await capture_lead(
+            name="Jane Smith", email="jane@acme.com", company="Acme Plumbing", pain_point="manual invoicing"
+        )
+
+    assert result == {"status": "created", "person_id": "person-123"}
