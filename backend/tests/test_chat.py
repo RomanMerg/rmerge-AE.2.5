@@ -22,26 +22,19 @@ def _mock_db_session(row=None):
     return mock_session
 
 
-def _fake_docs(n=3):
-    return [
-        {
-            "title": f"Doc {i}",
-            "content": f"content {i}" * 20,
-            "metadata": {},
-            "similarity": 0.9 - i * 0.1,
-        }
-        for i in range(n)
-    ]
+def _make_ai_message(content=None, tool_calls=None):
+    """A minimal stand-in for a LangChain AIMessage: .content and .tool_calls."""
+    msg = MagicMock()
+    msg.content = content
+    msg.tool_calls = tool_calls or []
+    return msg
 
 
-def _mock_llm_client(reply="Here is your automation advice."):
-    mock_client = MagicMock()
-    mock_response = MagicMock()
-    mock_choice = MagicMock()
-    mock_choice.message.content = reply
-    mock_response.choices = [mock_choice]
-    mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
-    return mock_client
+def _configure_mock_llm(mock_chat_openai_cls, ainvoke_side_effect):
+    """Wire a patched `app.main.ChatOpenAI` class mock's .bind_tools().ainvoke chain."""
+    mock_chat_openai_cls.return_value.bind_tools.return_value.ainvoke = AsyncMock(
+        side_effect=ainvoke_side_effect
+    )
 
 
 async def _post_chat(payload):
@@ -54,20 +47,19 @@ async def _post_chat(payload):
 @pytest.mark.asyncio
 async def test_chat_new_session_returns_200_with_new_uuid_session_id():
     """POST /chat with no session_id returns 200 with a new UUID session_id."""
-    mock_session = _mock_db_session(row=None)  # no existing session -> INSERT path
+    mock_session = _mock_db_session(row=None)
+    ai_msg = _make_ai_message(content="Here is your automation advice.")
 
     with (
         patch("app.main.AsyncSessionLocal", return_value=mock_session),
-        patch("app.main.embed_text", new=AsyncMock(return_value=[0.0] * 1536)),
-        patch("app.main.search_documents", new=AsyncMock(return_value=_fake_docs())),
-        patch("app.main.AsyncOpenAI", return_value=_mock_llm_client()),
+        patch("app.main.ChatOpenAI") as mock_chat_cls,
     ):
+        _configure_mock_llm(mock_chat_cls, [ai_msg])
         response = await _post_chat({"message": "How can I automate invoicing?"})
 
     assert response.status_code == 200
     data = response.json()
     assert "session_id" in data
-    # Confirm it's a valid UUID string
     uuid.UUID(data["session_id"])
 
 
@@ -77,20 +69,19 @@ async def test_chat_existing_session_increments_turn_count():
     session_id = str(uuid.uuid4())
     existing_row = MagicMock(turn_count=2, history=[])
     mock_session = _mock_db_session(row=existing_row)
+    ai_msg = _make_ai_message(content="Sure, let's automate onboarding.")
 
     with (
         patch("app.main.AsyncSessionLocal", return_value=mock_session),
-        patch("app.main.embed_text", new=AsyncMock(return_value=[0.0] * 1536)),
-        patch("app.main.search_documents", new=AsyncMock(return_value=_fake_docs())),
-        patch("app.main.AsyncOpenAI", return_value=_mock_llm_client()),
+        patch("app.main.ChatOpenAI") as mock_chat_cls,
     ):
+        _configure_mock_llm(mock_chat_cls, [ai_msg])
         response = await _post_chat({"session_id": session_id, "message": "Automate onboarding"})
 
     assert response.status_code == 200
     data = response.json()
     assert data["session_id"] == session_id
     settings = get_settings()
-    # turn_count was 2 before this call -> after increment it's 3
     assert data["turns_remaining"] == settings.max_turns_per_session - 3
 
 
@@ -124,13 +115,13 @@ async def test_chat_reply_returned_from_llm():
     """The reply field in the response comes from the LLM completion."""
     mock_session = _mock_db_session(row=None)
     expected_reply = "Use Zapier to connect your CRM and email tool."
+    ai_msg = _make_ai_message(content=expected_reply)
 
     with (
         patch("app.main.AsyncSessionLocal", return_value=mock_session),
-        patch("app.main.embed_text", new=AsyncMock(return_value=[0.0] * 1536)),
-        patch("app.main.search_documents", new=AsyncMock(return_value=_fake_docs())),
-        patch("app.main.AsyncOpenAI", return_value=_mock_llm_client(reply=expected_reply)),
+        patch("app.main.ChatOpenAI") as mock_chat_cls,
     ):
+        _configure_mock_llm(mock_chat_cls, [ai_msg])
         response = await _post_chat({"message": "Help me automate follow-ups"})
 
     assert response.status_code == 200
@@ -138,22 +129,48 @@ async def test_chat_reply_returned_from_llm():
 
 
 @pytest.mark.asyncio
-async def test_chat_sources_have_title_and_similarity_keys():
-    """sources list contains up to 3 items with title and similarity fields."""
+async def test_chat_sources_empty_when_no_search_tool_called():
+    """sources stays [] when the LLM doesn't call search_automation_patterns this turn."""
     mock_session = _mock_db_session(row=None)
-    docs = _fake_docs(3)
+    ai_msg = _make_ai_message(content="Sure, tell me more about your process.")
 
     with (
         patch("app.main.AsyncSessionLocal", return_value=mock_session),
-        patch("app.main.embed_text", new=AsyncMock(return_value=[0.0] * 1536)),
-        patch("app.main.search_documents", new=AsyncMock(return_value=docs)),
-        patch("app.main.AsyncOpenAI", return_value=_mock_llm_client()),
+        patch("app.main.ChatOpenAI") as mock_chat_cls,
     ):
+        _configure_mock_llm(mock_chat_cls, [ai_msg])
+        response = await _post_chat({"message": "Hi there"})
+
+    assert response.json()["sources"] == []
+
+
+@pytest.mark.asyncio
+async def test_chat_sources_populated_when_search_tool_called():
+    """sources contains up to 3 items with title and similarity fields when the LLM calls search."""
+    mock_session = _mock_db_session(row=None)
+    tool_call = {"name": "search_automation_patterns", "args": {"task_description": "invoicing"}, "id": "call_1"}
+    first_msg = _make_ai_message(content=None, tool_calls=[tool_call])
+    second_msg = _make_ai_message(content="Based on patterns, use Zapier.")
+    fake_sources = [
+        {"title": "Pattern A", "similarity": 0.87},
+        {"title": "Pattern B", "similarity": 0.81},
+        {"title": "Pattern C", "similarity": 0.75},
+    ]
+
+    with (
+        patch("app.main.AsyncSessionLocal", return_value=mock_session),
+        patch("app.main.ChatOpenAI") as mock_chat_cls,
+        patch(
+            "app.main.search_automation_patterns",
+            new=AsyncMock(return_value={"formatted": "...", "sources": fake_sources}),
+        ),
+    ):
+        _configure_mock_llm(mock_chat_cls, [first_msg, second_msg])
         response = await _post_chat({"message": "What should I automate first?"})
 
     assert response.status_code == 200
     sources = response.json()["sources"]
-    assert len(sources) == 3
+    assert sources == fake_sources
     for source in sources:
         assert set(source.keys()) == {"title", "similarity"}
 
@@ -165,14 +182,105 @@ async def test_chat_turns_remaining_decrements_correctly():
     session_id = str(uuid.uuid4())
     existing_row = MagicMock(turn_count=0, history=[])
     mock_session = _mock_db_session(row=existing_row)
+    ai_msg = _make_ai_message(content="First reply.")
 
     with (
         patch("app.main.AsyncSessionLocal", return_value=mock_session),
-        patch("app.main.embed_text", new=AsyncMock(return_value=[0.0] * 1536)),
-        patch("app.main.search_documents", new=AsyncMock(return_value=_fake_docs())),
-        patch("app.main.AsyncOpenAI", return_value=_mock_llm_client()),
+        patch("app.main.ChatOpenAI") as mock_chat_cls,
     ):
+        _configure_mock_llm(mock_chat_cls, [ai_msg])
         response = await _post_chat({"session_id": session_id, "message": "First question"})
 
     assert response.status_code == 200
     assert response.json()["turns_remaining"] == settings.max_turns_per_session - 1
+
+
+@pytest.mark.asyncio
+async def test_chat_calculate_roi_tool_called_and_result_fed_back():
+    """When the LLM calls calculate_roi, it's executed (real function, deterministic) and
+    its result is fed back for a second LLM call."""
+    mock_session = _mock_db_session(row=None)
+    tool_call = {
+        "name": "calculate_roi",
+        "args": {"hours_saved_per_week": 5, "hourly_rate": 30, "setup_cost": 1000},
+        "id": "call_2",
+    }
+    first_msg = _make_ai_message(content=None, tool_calls=[tool_call])
+    second_msg = _make_ai_message(content="You'd save €7,800/year, paying back in about 7 weeks.")
+
+    with (
+        patch("app.main.AsyncSessionLocal", return_value=mock_session),
+        patch("app.main.ChatOpenAI") as mock_chat_cls,
+    ):
+        _configure_mock_llm(mock_chat_cls, [first_msg, second_msg])
+        response = await _post_chat(
+            {"message": "I spend 5 hours a week on invoicing, I make 30 EUR/hr, setup costs 1000"}
+        )
+
+    assert response.status_code == 200
+    assert response.json()["reply"] == "You'd save €7,800/year, paying back in about 7 weeks."
+    assert mock_chat_cls.return_value.bind_tools.return_value.ainvoke.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_chat_capture_lead_tool_called_and_result_fed_back():
+    """When the LLM calls capture_lead, it's executed and a confirming reply is produced."""
+    mock_session = _mock_db_session(row=None)
+    tool_call = {
+        "name": "capture_lead",
+        "args": {
+            "name": "Jane Smith",
+            "email": "jane@acme.com",
+            "company": "Acme Plumbing",
+            "pain_point": "manual invoicing",
+        },
+        "id": "call_3",
+    }
+    first_msg = _make_ai_message(content=None, tool_calls=[tool_call])
+    second_msg = _make_ai_message(content="Thanks Jane, I've saved your details — we'll follow up soon.")
+
+    with (
+        patch("app.main.AsyncSessionLocal", return_value=mock_session),
+        patch("app.main.ChatOpenAI") as mock_chat_cls,
+        patch("app.main.capture_lead", new=AsyncMock(return_value={"status": "created", "person_id": "abc-123"})),
+    ):
+        _configure_mock_llm(mock_chat_cls, [first_msg, second_msg])
+        response = await _post_chat(
+            {"message": "My name is Jane Smith, email jane@acme.com, I run Acme Plumbing, manual invoicing"}
+        )
+
+    assert response.status_code == 200
+    assert response.json()["reply"] == "Thanks Jane, I've saved your details — we'll follow up soon."
+
+
+@pytest.mark.asyncio
+async def test_chat_capture_lead_error_result_does_not_crash():
+    """A capture_lead error result produces a normal 200 response, not a 500."""
+    mock_session = _mock_db_session(row=None)
+    tool_call = {
+        "name": "capture_lead",
+        "args": {
+            "name": "Jane Smith",
+            "email": "jane@acme.com",
+            "company": "Acme Plumbing",
+            "pain_point": "manual invoicing",
+        },
+        "id": "call_4",
+    }
+    first_msg = _make_ai_message(content=None, tool_calls=[tool_call])
+    second_msg = _make_ai_message(content="I couldn't save your details right now, but let's continue.")
+
+    with (
+        patch("app.main.AsyncSessionLocal", return_value=mock_session),
+        patch("app.main.ChatOpenAI") as mock_chat_cls,
+        patch(
+            "app.main.capture_lead",
+            new=AsyncMock(return_value={"status": "error", "detail": "network error"}),
+        ),
+    ):
+        _configure_mock_llm(mock_chat_cls, [first_msg, second_msg])
+        response = await _post_chat(
+            {"message": "My name is Jane Smith, email jane@acme.com, I run Acme Plumbing, manual invoicing"}
+        )
+
+    assert response.status_code == 200
