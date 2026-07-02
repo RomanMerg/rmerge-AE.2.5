@@ -11,7 +11,7 @@ A domain-specialised AI chatbot built for Turing College Sprint 2 (Building Appl
 1. **Grounded advice** — `POST /chat` runs a session/turn-managed conversation. The LLM decides when to call `search_automation_patterns`, which retrieves the most relevant automation patterns from pgvector (curated knowledge base + live-refreshed tool documentation) rather than hallucinating a workflow.
 2. **ROI on demand** — once the user gives hours saved/week, hourly rate, and a rough setup cost, `calculate_roi` (pure, deterministic Python — no LLM cost) returns annual savings, payback period, 3-year net savings, and an automate/borderline/not-worth-it recommendation.
 3. **Lead capture** — once the user has explicitly given a name and email, `capture_lead` (a standalone FastMCP tool server) creates a Person record in Twenty CRM and attaches a note with their stated pain point — real REST API calls verified against a live Twenty CRM instance, not mocked.
-4. **Rate-limited, stateless-server sessions** — 8 turns per `session_id`, full history persisted to PostgreSQL as JSONB, 429 once the limit is hit.
+4. **Rate-limited, stateless-server sessions** — 8 turns per `session_id` AND 30 requests per IP per hour (independent of `session_id`, closing the session-cycling bypass), full history persisted to PostgreSQL as JSONB, 429 once either limit is hit.
 5. **Demo UI** — a Gradio chat interface for manual testing and the Sprint 2 submission demo (the planned production frontend is Next.js, built separately once UI design work happens — see [Roadmap](#roadmap--known-gaps)).
 
 ---
@@ -30,7 +30,7 @@ A domain-specialised AI chatbot built for Turing College Sprint 2 (Building Appl
 | ORM | SQLAlchemy async + asyncpg, raw `text()` SQL | No ORM models — explicit SQL throughout |
 | Demo UI | Gradio | Fast, disposable Sprint 2 demo harness |
 | Package manager | uv | No `pip install` anywhere in the project |
-| Tests | pytest-asyncio | 73 unit + 3 integration (76 total) |
+| Tests | pytest-asyncio | 88 unit + 3 integration (91 total) |
 
 ---
 
@@ -69,12 +69,13 @@ All three are bound to a single `ChatOpenAI` client as raw `{"type": "function",
 |---|---|---|
 | Include source citations in responses | Easy | ✅ `sources: [{title, similarity}]` on every `/chat` response where search fired |
 | Add real-time data updates to knowledge base | Medium | ✅ `live_ingester.py` fetches/chunks/embeds n8n, Twenty CRM, Make, Zapier, Lovable docs; `POST /admin/ingest?source=live` |
+| Calculate and display token usage and costs | Medium | ✅ `tokens_used`/`cost_usd` on every `/chat` response; real chat-completion token counts via LangChain's `usage_metadata`, estimated embedding tokens |
 | **Implement your tools as MCP servers** | Hard | ✅ `capture_lead` is a real FastMCP server (`uv run fastmcp run mcp_server/server.py`), not just an in-process function |
 | Conversation history/export, RAG viz, chatbot guide | Easy | ⬜ History persists to DB but no export endpoint; no RAG-process visualisation |
-| Multi-model support, caching, auth/personalisation, token/cost display, tool-result viz, conversation export, remote MCP server | Medium | ⬜ Not done |
+| Multi-model support, caching, auth/personalisation, tool-result viz, conversation export, remote MCP server | Medium | ⬜ Not done |
 | Cloud deploy w/ scaling, advanced indexing (RAPTOR/ColBERT), A/B testing, scheduled automated KB refresh, fine-tuning, multi-language, analytics dashboard, RAGAs evaluation | Hard | ⬜ Not done — local dev only, `live_ingester` is manually triggered, ivfflat is the only index strategy |
 
-**Current count toward "2 Medium + 1 Hard" max-points target: 1 Medium + 1 Hard.** Honest gap, not yet closed — see roadmap below.
+**Current count toward "2 Medium + 1 Hard" max-points target: 2 Medium + 1 Hard.**
 
 ---
 
@@ -84,6 +85,7 @@ All three are bound to a single `ChatOpenAI` client as raw `{"type": "function",
 - **Input validation** — message length capped (`max_input_chars`, default 600), `422` on violation, checked before any LLM/embedding call.
 - **Admin endpoint auth** — `/admin/ingest` requires `X-Admin-Key`, compared against `ADMIN_API_KEY` from settings.
 - **CORS allowlist** — `ALLOWED_ORIGINS` env-driven, not wildcard.
+- **Per-IP rate limiting** — `chat_requests` table logs every `/chat` call by IP; more than `max_requests_per_ip_per_hour` (default 30) in a rolling hour returns `429`, independent of `session_id` (closes the session-cycling bypass — a script can't dodge the per-session turn limit just by generating a fresh `session_id` every call).
 - **No secrets in the frontend** — Gradio (and the future Next.js UI) only ever calls `POST /chat`; OpenRouter/Twenty CRM keys never leave the backend.
 - **Settings discipline** — every credential is read via `get_settings()` (pydantic-settings, cached singleton); no module bypasses this with raw `os.getenv()` (this was a real bug, found and fixed — see [Roadmap](#roadmap--known-gaps)).
 - **Tool-call guardrail is prompt-level, not a hard validator** — `capture_lead`'s tool description instructs the LLM to only call it once name AND email are explicit; there is no separate input/intent classifier guard (a gap relative to a stricter security posture — noted honestly, not hidden).
@@ -114,9 +116,18 @@ CREATE TABLE documents (
     content_hash TEXT        UNIQUE,   -- sha256, idempotent re-ingest
     UNIQUE (title)
 );
+
+-- Per-IP request log, backs the hourly rate limit (independent of session_id)
+CREATE TABLE chat_requests (
+    id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    ip_address TEXT        NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 ```
 
-`documents_embedding_idx` is an ivfflat index (`lists = 10`, sized for a small KB — raise as it grows past ~10k rows). Search always sets `ivfflat.probes = 10` locally for full recall on a small dataset.
+`documents_embedding_idx` is an ivfflat index (`lists = 10`, sized for a small KB — raise as it grows past ~10k rows). Search always sets `ivfflat.probes = 10` locally for full recall on a small dataset. `chat_requests` has an index on `(ip_address, created_at)`; rows older than 24h are opportunistically pruned on each insert, so the table doesn't grow unbounded.
+
+> **Existing running Postgres containers** (e.g. from an earlier session) won't pick up `chat_requests` automatically — `init.sql` only runs on first container creation. Apply it manually against a live DB: `CREATE TABLE IF NOT EXISTS chat_requests (...)` from `init.sql`, then the matching index.
 
 ---
 
@@ -126,7 +137,7 @@ CREATE TABLE documents (
 |---|---|---|---|
 | GET | `/health` | None | Uptime check |
 | POST | `/admin/ingest` | `X-Admin-Key` | Ingest KB into pgvector — `?source=static` (6 curated files) or `?source=live` (n8n/Twenty/Make/Zapier/Lovable docs) |
-| POST | `/chat` | None | Session-managed, tool-calling chat. Request: `{session_id?, message}`. Response: `{session_id, reply, sources, turns_remaining}` |
+| POST | `/chat` | None | Session-managed, tool-calling chat. Request: `{session_id?, message}`. Response: `{session_id, reply, sources, turns_remaining, tokens_used, cost_usd}`. `429` on either the per-session turn limit or the per-IP hourly rate limit, distinguished by the `detail` message |
 
 ---
 
@@ -199,6 +210,19 @@ curl -X POST http://localhost:8000/chat \
   -d '{"message": "I spend 4 hours a week manually creating invoices in Word and emailing them"}'
 ```
 
+### Testing the new limits from the Gradio UI
+
+**Token/cost display** — just chat normally. Every reply now ends with a line like `*7 turns remaining · 150 tokens · $0.000123 this turn.*` — no setup needed beyond having the server and UI running (see above).
+
+**Per-session turn limit (8 turns)** — send 8 messages in the same browser session (don't click "New conversation" between them). The 9th returns `429` with detail `"Session turn limit reached"`, shown in the chat as an error message.
+
+**Per-IP rate limit (30/hour)** — harder to trigger by hand in real time, since it's independent of `session_id`: clicking "New conversation" resets the turn counter but not the IP counter, so you'd need 31 real `/chat` calls (across any number of sessions) within an hour to see it fire naturally. The fast way to actually see the `429` while testing:
+
+1. Temporarily lower the limit for a quick test: add `MAX_REQUESTS_PER_IP_PER_HOUR=3` to `backend/.env`.
+2. Restart the server (`Ctrl+C`, re-run `uv run python -m uvicorn app.main:app --reload --port 8000`) — settings are cached per-process, so a running server won't pick up the change.
+3. Send 4 messages via the Gradio UI (clicking "New conversation" in between is fine — this limit doesn't care about `session_id`). The 4th should return `429` with detail `"Too many requests from this IP — try again later"`.
+4. Remove the override (or set it back to `30`) and restart the server again before real use.
+
 ---
 
 ## Running Tests
@@ -206,7 +230,7 @@ curl -X POST http://localhost:8000/chat \
 ```bash
 cd backend
 
-# Unit tests only (no DB required) — 73 tests
+# Unit tests only (no DB required) — 88 tests
 uv run python -m pytest -m "not integration"
 
 # Integration tests (requires live Postgres with pgvector) — 3 tests
@@ -226,6 +250,8 @@ rmerge-AE.2.5/
 │   │   ├── main.py              # FastAPI app: /health, /admin/ingest, /chat (LangChain tool-calling loop)
 │   │   ├── config.py            # Pydantic Settings — every credential goes through get_settings()
 │   │   ├── db.py                # Async SQLAlchemy engine + session factory
+│   │   ├── rate_limit.py        # get_client_ip(), check_ip_rate_limit() — per-IP hourly cap, Postgres-backed
+│   │   ├── cost_tracker.py      # calculate_cost(), estimate_embedding_tokens(), MODEL_PRICING
 │   │   ├── rag/
 │   │   │   ├── ingest.py        # Static KB ingestion — sha256 idempotency, embed_text(), pgvector upsert
 │   │   │   ├── retriever.py     # search_documents() — cosine similarity, ivfflat probes=10
@@ -236,7 +262,7 @@ rmerge-AE.2.5/
 │   ├── mcp_server/
 │   │   └── server.py            # FastMCP capture_lead — real Twenty CRM /rest/ API calls
 │   ├── knowledge_base/          # 6 curated automation pattern markdown files
-│   └── tests/                   # 73 unit + 3 integration (pytest-asyncio, asyncio_mode=auto)
+│   └── tests/                   # 88 unit + 3 integration (pytest-asyncio, asyncio_mode=auto)
 ├── frontend/
 │   └── app.py                   # Gradio chat demo — disposable Sprint 2 harness
 ├── docs/
@@ -256,7 +282,7 @@ Documented honestly rather than glossed over:
 
 - **Structured logging** (session_id, tools called, tokens, cost per request) — planned, not built. Currently just uvicorn access logs.
 - **Production frontend (Next.js)** — deliberately deferred to its own design + build session; Gradio is explicitly a throwaway demo, not competing with this plan.
-- **Only 1 Medium + 1 Hard optional task done** — short of the "2 Medium + 1 Hard" max-points target. Real-time KB updates (Medium) and MCP-server tools (Hard) are solid; token/cost display or conversation export would be the next cheapest Medium wins.
+- **2 Medium + 1 Hard optional tasks done** — real-time KB updates, MCP-server tools, and token/cost tracking. Still short of the stretch goal of adding more (e.g. conversation export, multi-model support) if pursued further.
 - **`live_ingester.py` is manually triggered**, not on a schedule — "automated KB updates" (Hard optional) isn't fully satisfied.
 - **No intent/jailbreak guard** on chat input beyond length validation and the LLM's own tool-call judgment — a stricter security posture would add a dedicated input classifier, as this project's Sprint 1 predecessor did.
 - **Two real integration bugs were found via live manual testing (not mocks)** during this session and fixed: `capture_lead` was hitting the wrong Twenty CRM REST paths/payload shapes, and separately never actually loaded its API key due to a `os.getenv()` vs `get_settings()` mismatch. Both fixed and re-verified against a real Twenty CRM instance — flagged here as a reminder that mocked test suites alone don't catch integration-boundary bugs.
