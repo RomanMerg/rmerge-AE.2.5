@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_embedding_model: str = "nomic-embed-text"
 
+    # Twenty CRM (for capture_lead MCP tool)
+    twenty_api_key: str = ""
+    twenty_base_url: str = "http://localhost:3001"
+
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",")]

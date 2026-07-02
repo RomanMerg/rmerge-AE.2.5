@@ -8,14 +8,12 @@ Run with:
 Or as MCP stdio server (for Gradio / Claude Desktop):
     uv run fastmcp run mcp_server/server.py
 """
-import os
 import httpx
 from fastmcp import FastMCP
 
-mcp = FastMCP("automate-this-lead-capture")
+from app.config import get_settings
 
-TWENTY_BASE_URL = os.getenv("TWENTY_BASE_URL", "http://localhost:3001")
-TWENTY_API_KEY = os.getenv("TWENTY_API_KEY", "")
+mcp = FastMCP("automate-this-lead-capture")
 
 
 @mcp.tool()
@@ -38,8 +36,9 @@ async def capture_lead(
         {"status": "created", "person_id": "<uuid>"} on success
         {"status": "error", "detail": "<msg>"} on failure
     """
+    settings = get_settings()
     headers = {
-        "Authorization": f"Bearer {TWENTY_API_KEY}",
+        "Authorization": f"Bearer {settings.twenty_api_key}",
         "Content-Type": "application/json",
     }
     first, *rest = name.strip().split(" ", 1)
@@ -54,7 +53,7 @@ async def capture_lead(
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resp = await client.post(
-                f"{TWENTY_BASE_URL}/rest/people",
+                f"{settings.twenty_base_url}/rest/people",
                 json=payload,
                 headers=headers,
             )
@@ -69,7 +68,7 @@ async def capture_lead(
         try:
             # Best-effort: a failed note (or link) shouldn't erase a successful Person creation.
             note_resp = await client.post(
-                f"{TWENTY_BASE_URL}/rest/notes",
+                f"{settings.twenty_base_url}/rest/notes",
                 json={
                     "title": f"Automation pain point — {company}",
                     "bodyV2": {"markdown": pain_point},
@@ -81,7 +80,7 @@ async def capture_lead(
 
             if note_id and person_id != "unknown":
                 await client.post(
-                    f"{TWENTY_BASE_URL}/rest/noteTargets",
+                    f"{settings.twenty_base_url}/rest/noteTargets",
                     json={"noteId": note_id, "targetPersonId": person_id},
                     headers=headers,
                 )
