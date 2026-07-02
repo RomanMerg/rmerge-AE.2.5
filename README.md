@@ -1,153 +1,262 @@
 # Automate This — SMB Automation Advisor
 
-AI-powered chatbot backend that advises small businesses on which manual workflows to automate first and how to get started. Built with FastAPI, pgvector RAG, and OpenRouter LLMs.
+A domain-specialised AI chatbot built for Turing College Sprint 2 (Building Applications with LangChain, RAGs, and Tool Calling). Small business owners describe a repetitive manual task; the advisor grounds its answer in a curated + live-refreshed knowledge base, calculates ROI on request, and — once a user has given their name and email — saves them as a qualified lead directly in Twenty CRM. Also the working foundation for a real AI-automation-consulting business.
+
+**GitHub:** https://github.com/RomanMerg/rmerge-AE.2.5
+
+---
 
 ## What It Does
 
-- Accepts a natural-language description of a business problem
-- Retrieves the most relevant automation patterns from a curated knowledge base (pgvector cosine similarity)
-- Supplements retrieval with live documentation from n8n, Twenty CRM, Make, Zapier, and Lovable
-- Returns a structured recommendation: what to automate, which tools to use, estimated ROI
+1. **Grounded advice** — `POST /chat` runs a session/turn-managed conversation. The LLM decides when to call `search_automation_patterns`, which retrieves the most relevant automation patterns from pgvector (curated knowledge base + live-refreshed tool documentation) rather than hallucinating a workflow.
+2. **ROI on demand** — once the user gives hours saved/week, hourly rate, and a rough setup cost, `calculate_roi` (pure, deterministic Python — no LLM cost) returns annual savings, payback period, 3-year net savings, and an automate/borderline/not-worth-it recommendation.
+3. **Lead capture** — once the user has explicitly given a name and email, `capture_lead` (a standalone FastMCP tool server) creates a Person record in Twenty CRM and attaches a note with their stated pain point — real REST API calls verified against a live Twenty CRM instance, not mocked.
+4. **Rate-limited, stateless-server sessions** — 8 turns per `session_id`, full history persisted to PostgreSQL as JSONB, 429 once the limit is hit.
+5. **Demo UI** — a Gradio chat interface for manual testing and the Sprint 2 submission demo (the planned production frontend is Next.js, built separately once UI design work happens — see [Roadmap](#roadmap--known-gaps)).
 
-## Tech Stack
+---
 
-| Layer | Choice |
-|---|---|
-| API | FastAPI (async) |
-| Embeddings | `text-embedding-3-small` via OpenRouter (1536-dim) |
-| Vector store | pgvector (PostgreSQL 16, ivfflat index) |
-| ORM | SQLAlchemy async + asyncpg |
-| Package manager | uv |
-| Tests | pytest-asyncio (39 unit + 3 integration tests) |
+## Stack
 
-## Project Structure
+| Component | Choice | Rationale |
+|---|---|---|
+| API | FastAPI (async) | `/chat`, `/health`, `/admin/ingest` |
+| LLM orchestration | LangChain (`langchain-openai` `ChatOpenAI`) | Bound to 3 raw OpenAI-format tool schemas; bounded 2-call tool loop, no `AgentExecutor` |
+| LLM | `openai/gpt-4o-mini` via OpenRouter | Mandatory OpenAI-compatible SDK requirement |
+| Embeddings | `text-embedding-3-small` via OpenRouter (1536-dim) | Matches the `VECTOR(1536)` schema |
+| Vector store | pgvector (PostgreSQL 16, ivfflat index) | Cosine similarity search over curated + live docs |
+| Tool protocol | FastMCP | `capture_lead` is a real MCP tool server, callable standalone (`fastmcp run`) or imported in-process by `/chat` |
+| CRM | Twenty CRM (self-hosted, REST API) | Lead storage — Person + linked Note per capture |
+| ORM | SQLAlchemy async + asyncpg, raw `text()` SQL | No ORM models — explicit SQL throughout |
+| Demo UI | Gradio | Fast, disposable Sprint 2 demo harness |
+| Package manager | uv | No `pip install` anywhere in the project |
+| Tests | pytest-asyncio | 73 unit + 3 integration (76 total) |
 
+---
+
+## Tools (LangChain `bind_tools`)
+
+| Tool | Type | What it does |
+|---|---|---|
+| `search_automation_patterns` | RAG retrieval (async) | Embeds the query, pgvector cosine search (top-3) over static + live KB, returns formatted context for the LLM plus `{title, similarity}` sources for the API response |
+| `calculate_roi` | Pure Python, deterministic, zero LLM cost | `hours_saved_per_week × hourly_rate` → annual savings, payback weeks, 3-year net savings, `automate` / `borderline` / `not worth it` |
+| `capture_lead` | FastMCP tool → Twenty CRM REST API | Creates a Person (`POST /rest/people`), a Note with the stated pain point (`POST /rest/notes`, `bodyV2.markdown`), and links them (`POST /rest/noteTargets`) — only invoked by the LLM once name AND email have been explicitly given |
+
+All three are bound to a single `ChatOpenAI` client as raw `{"type": "function", ...}` schemas (not `@tool`-decorated functions) inside one bounded 2-call loop per turn: first call may return tool calls, they execute, results feed back as `ToolMessage`s, second call produces the reply.
+
+---
+
+## Sprint 2 Requirement Coverage — part of learning project submission
+
+### Core Requirements
+
+| Requirement | Status | Implementation |
+|---|---|---|
+| RAG with embeddings + chunking + similarity search | ✅ | `text-embedding-3-small`, pgvector ivfflat cosine search; live docs chunked 800 tok / 100 overlap |
+| ≥3 different tool calls | ✅ | `search_automation_patterns`, `calculate_roi`, `capture_lead` |
+| LangChain with OpenRouter | ✅ | `langchain_openai.ChatOpenAI` bound to 3 tools, OpenRouter as the OpenAI-compatible endpoint |
+| Domain specialisation, focused KB | ✅ | SMB automation consulting; 6 curated pattern files + live n8n/Twenty/Make/Zapier/Lovable docs |
+| Proper error handling | ✅ | Empty-LLM-reply fallback, `capture_lead` never raises (isolates person-creation success from note/link failure), `AsyncSessionLocal` scoped per request |
+| Input validation, rate limiting, API key management | ✅ | `max_input_chars` → 422, `max_turns_per_session` → 429, `X-Admin-Key` on `/admin/ingest`, all secrets via `.env` / `get_settings()` (never `os.getenv` bypasses) |
+| Logging and monitoring | ⚠️ Partial | Uvicorn access logs only — structured per-request logging (session_id, tools called, tokens, cost) is planned but not yet built |
+| UI — Streamlit/Next.js | ⚠️ Substituted | Built with **Gradio** (sprint doc's own accepted "Python Track: Alternative") as a fast, disposable demo harness. Production Next.js frontend is a deliberately separate, later build — see [Roadmap](#roadmap--known-gaps) |
+| Show context/sources, display tool results | ✅ | Gradio renders source citations with similarity scores per reply |
+| Progress indicators for long operations | ⬜ Not done | |
+
+### Optional Tasks
+
+| Task | Tier | Status |
+|---|---|---|
+| Include source citations in responses | Easy | ✅ `sources: [{title, similarity}]` on every `/chat` response where search fired |
+| Add real-time data updates to knowledge base | Medium | ✅ `live_ingester.py` fetches/chunks/embeds n8n, Twenty CRM, Make, Zapier, Lovable docs; `POST /admin/ingest?source=live` |
+| **Implement your tools as MCP servers** | Hard | ✅ `capture_lead` is a real FastMCP server (`uv run fastmcp run mcp_server/server.py`), not just an in-process function |
+| Conversation history/export, RAG viz, chatbot guide | Easy | ⬜ History persists to DB but no export endpoint; no RAG-process visualisation |
+| Multi-model support, caching, auth/personalisation, token/cost display, tool-result viz, conversation export, remote MCP server | Medium | ⬜ Not done |
+| Cloud deploy w/ scaling, advanced indexing (RAPTOR/ColBERT), A/B testing, scheduled automated KB refresh, fine-tuning, multi-language, analytics dashboard, RAGAs evaluation | Hard | ⬜ Not done — local dev only, `live_ingester` is manually triggered, ivfflat is the only index strategy |
+
+**Current count toward "2 Medium + 1 Hard" max-points target: 1 Medium + 1 Hard.** Honest gap, not yet closed — see roadmap below.
+
+---
+
+## Security Measures
+
+- **Rate limiting** — 8 turns per `session_id`, enforced in Postgres (`conversations.turn_count`), not just client-side; `429` once exceeded.
+- **Input validation** — message length capped (`max_input_chars`, default 600), `422` on violation, checked before any LLM/embedding call.
+- **Admin endpoint auth** — `/admin/ingest` requires `X-Admin-Key`, compared against `ADMIN_API_KEY` from settings.
+- **CORS allowlist** — `ALLOWED_ORIGINS` env-driven, not wildcard.
+- **No secrets in the frontend** — Gradio (and the future Next.js UI) only ever calls `POST /chat`; OpenRouter/Twenty CRM keys never leave the backend.
+- **Settings discipline** — every credential is read via `get_settings()` (pydantic-settings, cached singleton); no module bypasses this with raw `os.getenv()` (this was a real bug, found and fixed — see [Roadmap](#roadmap--known-gaps)).
+- **Tool-call guardrail is prompt-level, not a hard validator** — `capture_lead`'s tool description instructs the LLM to only call it once name AND email are explicit; there is no separate input/intent classifier guard (a gap relative to a stricter security posture — noted honestly, not hidden).
+
+---
+
+## Database Schema
+
+PostgreSQL 16 + `pgvector`. Two tables, both created by `init.sql` on first container start.
+
+```sql
+-- Conversation tracking and per-session rate limiting
+CREATE TABLE conversations (
+    session_id  UUID        PRIMARY KEY,
+    turn_count  INTEGER     NOT NULL DEFAULT 0,
+    history     JSONB       NOT NULL DEFAULT '[]',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- RAG document store — static patterns + live docs share this table
+CREATE TABLE documents (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    title        TEXT        NOT NULL,
+    content      TEXT        NOT NULL,
+    embedding    VECTOR(1536),
+    metadata     JSONB       NOT NULL DEFAULT '{}',
+    content_hash TEXT        UNIQUE,   -- sha256, idempotent re-ingest
+    UNIQUE (title)
+);
 ```
-backend/
-  app/
-    main.py              # FastAPI app + /health + /admin/ingest endpoints
-    config.py            # Pydantic settings (reads from .env)
-    db.py                # Async SQLAlchemy engine + session factory
-    rag/
-      ingest.py          # Static KB ingestion — sha256 idempotency, pgvector upsert
-      retriever.py       # Cosine similarity search (ivfflat, probes=10)
-      live_ingester.py   # Fetch + chunk + embed live docs from 7 sources
-  knowledge_base/        # 6 curated automation pattern markdown files
-  tests/
-    test_health.py       # /health + /admin/ingest endpoint tests
-    test_ingest.py       # Unit tests for ingest, retriever, live ingester
-    test_rag_integration.py  # Integration tests (requires live pgvector DB)
-init.sql                 # DB schema + ivfflat index (runs on fresh Postgres volume)
-docker-compose.yml       # Postgres 16 + pgvector for local dev
-```
 
-## Setup
+`documents_embedding_idx` is an ivfflat index (`lists = 10`, sized for a small KB — raise as it grows past ~10k rows). Search always sets `ivfflat.probes = 10` locally for full recall on a small dataset.
 
-### Prerequisites
-
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/getting-started/installation/)
-- Docker (for local Postgres) or a Postgres 16 instance with pgvector
-
-### 1. Clone and install
-
-```bash
-git clone https://github.com/RomanMerg/rmerge-AE.2.5.git
-cd rmerge-AE.2.5/backend
-uv sync
-```
-
-### 2. Configure environment
-
-```bash
-cp .env.example .env
-# Edit .env with your OpenRouter API key and database URL
-```
-
-Required variables:
-
-| Variable | Description |
-|---|---|
-| `OPENROUTER_API_KEY` | OpenRouter key — get one at openrouter.ai/keys |
-| `DATABASE_URL` | `postgresql+asyncpg://user:pass@host:5432/dbname` |
-| `ADMIN_API_KEY` | Random secret for the `/admin/ingest` endpoint |
-
-### 3. Start Postgres
-
-```bash
-# From the repo root
-docker compose up -d
-```
-
-This starts Postgres 16 with pgvector and runs `init.sql` to create the `documents` table and ivfflat index.
-
-> **Existing Postgres?** If you already have a Postgres 16 instance with pgvector, create the database and run `init.sql` manually:
-> ```sql
-> CREATE DATABASE automate_this;
-> \c automate_this
-> CREATE EXTENSION IF NOT EXISTS vector;
-> -- then paste contents of init.sql
-> ```
-
-### 4. Ingest the knowledge base
-
-```bash
-# Static KB (6 curated automation pattern files)
-curl -X POST "http://localhost:8000/admin/ingest?source=static" \
-  -H "X-Admin-Key: your_admin_key"
-
-# Live docs from n8n, Twenty CRM, Make, Zapier, Lovable (optional)
-curl -X POST "http://localhost:8000/admin/ingest?source=live" \
-  -H "X-Admin-Key: your_admin_key"
-```
-
-### 5. Run the API
-
-```bash
-uv run uvicorn app.main:app --reload
-```
-
-API available at `http://localhost:8000`. Docs at `http://localhost:8000/docs`.
+---
 
 ## API Endpoints
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/health` | None | Uptime check |
-| POST | `/admin/ingest` | `X-Admin-Key` | Ingest KB into pgvector |
+| POST | `/admin/ingest` | `X-Admin-Key` | Ingest KB into pgvector — `?source=static` (6 curated files) or `?source=live` (n8n/Twenty/Make/Zapier/Lovable docs) |
+| POST | `/chat` | None | Session-managed, tool-calling chat. Request: `{session_id?, message}`. Response: `{session_id, reply, sources, turns_remaining}` |
 
-Query params for `/admin/ingest`: `source=static` (default) or `source=live`.
+---
+
+## Knowledge Base
+
+Six curated automation patterns in `backend/knowledge_base/`, each with manual time-cost benchmarks, recommended tools, an n8n node outline, and an ROI benchmark:
+
+- **Lead Capture** — CRM auto-population from web forms
+- **Email Parsing** — extract structured data from inbound emails
+- **Invoice Generation** — auto-generate invoices from completed jobs
+- **Appointment Booking** — calendar sync and confirmation flows
+- **Client Onboarding** — welcome sequences and account provisioning
+- **Social Media Scheduling** — content queue and multi-platform posting
+
+Supplemented by live-fetched documentation (n8n, Twenty CRM, Make.com, Zapier, Lovable) — same table, `metadata.source = "live"`, indistinguishable to `search_automation_patterns` beyond the metadata tag.
+
+---
+
+## Infrastructure
+
+| Service | Host | Port |
+|---|---|---|
+| FastAPI backend | localhost | 8000 (or next free port — Twenty CRM and other local services may already occupy 8000) |
+| Gradio demo UI | localhost | 7860 |
+| PostgreSQL + pgvector | localhost | 5432 |
+| Twenty CRM | localhost | 3001 |
+| OpenRouter API | openrouter.ai | 443 |
+
+Postgres runs via `docker-compose.yml`; Twenty CRM runs as a separately-managed local instance (not part of this repo's compose stack).
+
+---
+
+## Running Locally
+
+**Prerequisites:** Python 3.12+, [uv](https://docs.astral.sh/uv/getting-started/installation/), Docker (for Postgres) or an existing Postgres 16 + pgvector instance, an OpenRouter API key, and a running Twenty CRM instance with an API key (Settings → API → Generate new key) if you want `capture_lead` to work end-to-end.
+
+```bash
+# Clone and install
+git clone https://github.com/RomanMerg/rmerge-AE.2.5.git
+cd rmerge-AE.2.5/backend
+uv sync
+
+# Configure environment
+cp .env.example .env
+# Fill in OPENROUTER_API_KEY, DATABASE_URL, ADMIN_API_KEY, TWENTY_API_KEY, TWENTY_BASE_URL
+
+# Start Postgres (from repo root)
+cd ..
+docker compose up -d
+
+# Ingest the knowledge base
+curl -X POST "http://localhost:8000/admin/ingest?source=static" -H "X-Admin-Key: your_admin_key"
+
+# Run the API
+cd backend
+uv run python -m uvicorn app.main:app --reload --port 8000
+# note: `uv run uvicorn ...` (without `python -m`) fails in some checkouts with a broken
+# trampoline path — use `uv run python -m uvicorn` if you hit that.
+
+# Run the Gradio demo (separate terminal)
+uv run python frontend/app.py
+```
+
+API at `http://localhost:8000` (docs at `/docs`), Gradio demo at `http://localhost:7860`.
+
+```bash
+# Try it
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "I spend 4 hours a week manually creating invoices in Word and emailing them"}'
+```
+
+---
 
 ## Running Tests
 
 ```bash
 cd backend
 
-# Unit tests only (no DB required)
-uv run pytest -m "not integration"
+# Unit tests only (no DB required) — 73 tests
+uv run python -m pytest -m "not integration"
 
-# Integration tests (requires live Postgres with pgvector)
-uv run pytest -m integration -v
+# Integration tests (requires live Postgres with pgvector) — 3 tests
+uv run python -m pytest -m integration -v
 ```
 
-## Knowledge Base
+> `uv run pytest` (without `python -m`) is broken in some checkouts — always use `uv run python -m pytest`.
 
-Six curated automation patterns in `backend/knowledge_base/`, each covering:
+---
 
-- **Lead Capture** — CRM auto-population from web forms
-- **Email Parsing** — Extract structured data from inbound emails
-- **Invoice Generation** — Auto-generate invoices from completed jobs
-- **Appointment Booking** — Calendar sync and confirmation flows
-- **Client Onboarding** — Welcome sequences and account provisioning
-- **Social Media Scheduling** — Content queue and multi-platform posting
+## Project Structure
 
-Each pattern includes manual time cost benchmarks, recommended tools, n8n node outlines, and ROI estimates.
-
-## Schema Notes
-
-The `documents` table has `UNIQUE` constraints on both `title` and `content_hash`. If you modify the schema after initial setup, run the migration manually:
-
-```sql
--- If adding UNIQUE(title) to an existing DB:
-ALTER TABLE documents ADD UNIQUE (title);
 ```
+rmerge-AE.2.5/
+├── backend/
+│   ├── app/
+│   │   ├── main.py              # FastAPI app: /health, /admin/ingest, /chat (LangChain tool-calling loop)
+│   │   ├── config.py            # Pydantic Settings — every credential goes through get_settings()
+│   │   ├── db.py                # Async SQLAlchemy engine + session factory
+│   │   ├── rag/
+│   │   │   ├── ingest.py        # Static KB ingestion — sha256 idempotency, embed_text(), pgvector upsert
+│   │   │   ├── retriever.py     # search_documents() — cosine similarity, ivfflat probes=10
+│   │   │   └── live_ingester.py # Fetch + chunk (800/100 overlap) + embed live docs, 5 sources
+│   │   └── tools/
+│   │       ├── roi.py           # calculate_roi() — pure, deterministic
+│   │       └── search.py        # search_automation_patterns() — wraps rag/ for LLM tool-calling
+│   ├── mcp_server/
+│   │   └── server.py            # FastMCP capture_lead — real Twenty CRM /rest/ API calls
+│   ├── knowledge_base/          # 6 curated automation pattern markdown files
+│   └── tests/                   # 73 unit + 3 integration (pytest-asyncio, asyncio_mode=auto)
+├── frontend/
+│   └── app.py                   # Gradio chat demo — disposable Sprint 2 harness
+├── docs/
+│   ├── superpowers/
+│   │   ├── specs/                                    # Original approved design spec
+│   │   └── plans/2026-07-02-session-3-tools-langchain.md  # Executed plan for tools + LangChain retrofit
+│   └── session-3-chat-mcp.md    # Earlier plan — Tasks 1-2 built as-is, Tasks 3-5 superseded (see banner in file)
+├── init.sql                     # conversations + documents tables, ivfflat index
+└── docker-compose.yml           # Postgres 16 + pgvector for local dev
+```
+
+---
+
+## Roadmap / Known Gaps
+
+Documented honestly rather than glossed over:
+
+- **Structured logging** (session_id, tools called, tokens, cost per request) — planned, not built. Currently just uvicorn access logs.
+- **Production frontend (Next.js)** — deliberately deferred to its own design + build session; Gradio is explicitly a throwaway demo, not competing with this plan.
+- **Only 1 Medium + 1 Hard optional task done** — short of the "2 Medium + 1 Hard" max-points target. Real-time KB updates (Medium) and MCP-server tools (Hard) are solid; token/cost display or conversation export would be the next cheapest Medium wins.
+- **`live_ingester.py` is manually triggered**, not on a schedule — "automated KB updates" (Hard optional) isn't fully satisfied.
+- **No intent/jailbreak guard** on chat input beyond length validation and the LLM's own tool-call judgment — a stricter security posture would add a dedicated input classifier, as this project's Sprint 1 predecessor did.
+- **Two real integration bugs were found via live manual testing (not mocks)** during this session and fixed: `capture_lead` was hitting the wrong Twenty CRM REST paths/payload shapes, and separately never actually loaded its API key due to a `os.getenv()` vs `get_settings()` mismatch. Both fixed and re-verified against a real Twenty CRM instance — flagged here as a reminder that mocked test suites alone don't catch integration-boundary bugs.
