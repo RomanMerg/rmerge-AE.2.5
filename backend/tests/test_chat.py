@@ -2,6 +2,7 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from app.config import get_settings
@@ -22,11 +23,12 @@ def _mock_db_session(row=None):
     return mock_session
 
 
-def _make_ai_message(content=None, tool_calls=None):
-    """A minimal stand-in for a LangChain AIMessage: .content and .tool_calls."""
+def _make_ai_message(content=None, tool_calls=None, usage_metadata=None):
+    """A minimal stand-in for a LangChain AIMessage: .content, .tool_calls, .usage_metadata."""
     msg = MagicMock()
     msg.content = content
     msg.tool_calls = tool_calls or []
+    msg.usage_metadata = usage_metadata if usage_metadata is not None else {"input_tokens": 10, "output_tokens": 20}
     return msg
 
 
@@ -38,10 +40,13 @@ def _configure_mock_llm(mock_chat_openai_cls, ainvoke_side_effect):
 
 
 async def _post_chat(payload):
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        return await client.post("/chat", json=payload)
+    """POST /chat with the per-IP rate limit no-op'd (it has its own dedicated tests in
+    test_rate_limit.py; individual chat tests shouldn't need to think about it)."""
+    with patch("app.main.check_ip_rate_limit", new=AsyncMock()):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            return await client.post("/chat", json=payload)
 
 
 @pytest.mark.asyncio
@@ -106,6 +111,22 @@ async def test_chat_turn_limit_reached_returns_429():
 
     with patch("app.main.AsyncSessionLocal", return_value=mock_session):
         response = await _post_chat({"session_id": session_id, "message": "One more question"})
+
+    assert response.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_chat_returns_429_when_ip_rate_limit_exceeded():
+    """POST /chat returns 429 when check_ip_rate_limit raises (IP over the hourly threshold).
+    Deliberately does NOT use _post_chat, since that helper no-ops the IP check."""
+    with patch(
+        "app.main.check_ip_rate_limit",
+        new=AsyncMock(side_effect=HTTPException(429, "Too many requests from this IP — try again later")),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post("/chat", json={"message": "Hello"})
 
     assert response.status_code == 429
 
@@ -308,3 +329,51 @@ async def test_chat_empty_llm_content_falls_back_to_default_reply():
 
     assert response.status_code == 200
     assert response.json()["reply"] != ""
+
+
+@pytest.mark.asyncio
+async def test_chat_tokens_used_and_cost_reflect_llm_usage_metadata():
+    """tokens_used and cost_usd are computed from the LLM's real usage_metadata."""
+    mock_session = _mock_db_session(row=None)
+    ai_msg = _make_ai_message(
+        content="Here's some advice.",
+        usage_metadata={"input_tokens": 100, "output_tokens": 50},
+    )
+
+    with (
+        patch("app.main.AsyncSessionLocal", return_value=mock_session),
+        patch("app.main.ChatOpenAI") as mock_chat_cls,
+    ):
+        _configure_mock_llm(mock_chat_cls, [ai_msg])
+        response = await _post_chat({"message": "How can I automate invoicing?"})
+
+    data = response.json()
+    assert data["tokens_used"] == 150
+    expected_cost = (100 / 1_000_000) * 0.15 + (50 / 1_000_000) * 0.60
+    assert data["cost_usd"] == round(expected_cost, 6)
+
+
+@pytest.mark.asyncio
+async def test_chat_tokens_used_includes_embedding_estimate_when_search_called():
+    """tokens_used includes an estimated embedding token count when search_automation_patterns fires."""
+    mock_session = _mock_db_session(row=None)
+    tool_call = {"name": "search_automation_patterns", "args": {"task_description": "x" * 40}, "id": "call_6"}
+    first_msg = _make_ai_message(
+        content=None, tool_calls=[tool_call], usage_metadata={"input_tokens": 30, "output_tokens": 5}
+    )
+    second_msg = _make_ai_message(content="Use Zapier.", usage_metadata={"input_tokens": 60, "output_tokens": 20})
+
+    with (
+        patch("app.main.AsyncSessionLocal", return_value=mock_session),
+        patch("app.main.ChatOpenAI") as mock_chat_cls,
+        patch(
+            "app.main.search_automation_patterns",
+            new=AsyncMock(return_value={"formatted": "...", "sources": []}),
+        ),
+    ):
+        _configure_mock_llm(mock_chat_cls, [first_msg, second_msg])
+        response = await _post_chat({"message": "What should I automate?"})
+
+    data = response.json()
+    # 30+5 (first call) + 60+20 (second call) + estimate_embedding_tokens("x"*40)=10
+    assert data["tokens_used"] == 30 + 5 + 60 + 20 + 10

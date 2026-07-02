@@ -2,7 +2,7 @@ import json
 import uuid
 from typing import Literal
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
@@ -16,6 +16,8 @@ from app.rag.live_ingester import ingest_live_docs
 from app.tools.roi import calculate_roi
 from app.tools.search import search_automation_patterns
 from mcp_server.server import capture_lead
+from app.rate_limit import check_ip_rate_limit, get_client_ip
+from app.cost_tracker import calculate_cost, estimate_embedding_tokens
 
 app = FastAPI(
     title="Automate This API",
@@ -71,6 +73,8 @@ class ChatResponse(BaseModel):
     reply: str
     sources: list[dict]  # [{title, similarity}, ...] — populated only if search_automation_patterns was called
     turns_remaining: int
+    tokens_used: int
+    cost_usd: float
 
 
 CALCULATE_ROI_TOOL = {
@@ -147,13 +151,21 @@ SYSTEM_PROMPT = (
 )
 
 
+def _usage_tokens(ai_message) -> tuple[int, int]:
+    """Extract (input_tokens, output_tokens) from an AIMessage's usage_metadata, defaulting to 0."""
+    usage = getattr(ai_message, "usage_metadata", None) or {}
+    return usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+
+
 @app.post("/chat", tags=["chat"])
-async def chat(body: ChatRequest) -> ChatResponse:
+async def chat(body: ChatRequest, request: Request) -> ChatResponse:
     """Multi-turn chat with tool calling (search_automation_patterns, calculate_roi, capture_lead) via LangChain."""
     settings = get_settings()
 
     if len(body.message) > settings.max_input_chars:
         raise HTTPException(422, f"Message exceeds {settings.max_input_chars} chars")
+
+    await check_ip_rate_limit(get_client_ip(request))
 
     session_id = body.session_id or str(uuid.uuid4())
     async with AsyncSessionLocal() as session:
@@ -196,6 +208,8 @@ async def chat(body: ChatRequest) -> ChatResponse:
 
     ai_message = await llm.ainvoke(messages)
     sources: list[dict] = []
+    total_input_tokens, total_output_tokens = _usage_tokens(ai_message)
+    total_cost = calculate_cost(settings.chat_model, total_input_tokens, total_output_tokens)
 
     if ai_message.tool_calls:
         messages.append(ai_message)
@@ -209,6 +223,9 @@ async def chat(body: ChatRequest) -> ChatResponse:
                 search_result = await search_automation_patterns(**tool_args)
                 sources = search_result["sources"]
                 tool_result = search_result["formatted"]
+                embedding_tokens = estimate_embedding_tokens(tool_args.get("task_description", ""))
+                total_input_tokens += embedding_tokens
+                total_cost += calculate_cost(settings.embedding_model, embedding_tokens, 0)
             elif tool_name == "capture_lead":
                 tool_result = await capture_lead(**tool_args)
             else:
@@ -220,6 +237,10 @@ async def chat(body: ChatRequest) -> ChatResponse:
 
         final_message = await llm.ainvoke(messages)
         reply = final_message.content or "I've made a note of that — could you tell me more?"
+        final_in, final_out = _usage_tokens(final_message)
+        total_input_tokens += final_in
+        total_output_tokens += final_out
+        total_cost += calculate_cost(settings.chat_model, final_in, final_out)
     else:
         reply = ai_message.content or "Could you tell me more about what you're looking to automate?"
 
@@ -242,4 +263,6 @@ async def chat(body: ChatRequest) -> ChatResponse:
         reply=reply,
         sources=sources,
         turns_remaining=settings.max_turns_per_session - (turn_count + 1),
+        tokens_used=total_input_tokens + total_output_tokens,
+        cost_usd=round(total_cost, 6),
     )
