@@ -20,13 +20,16 @@ def chat(message: str, history: list) -> tuple[str, list]:
         )
         data = resp.json()
         if resp.status_code == 429:
-            return "Session limit reached. Please refresh to start a new conversation.", history
+            detail = data.get("detail", "Rate limit reached")
+            return f"{detail} Please try again later or start a new conversation.", history
         if resp.status_code != 200:
             return f"Error {resp.status_code}: {data.get('detail', 'Unknown error')}", history
 
         reply = data["reply"]
         turns_left = data.get("turns_remaining", "?")
         sources = data.get("sources", [])
+        tokens_used = data.get("tokens_used", 0)
+        cost_usd = data.get("cost_usd", 0.0)
 
         if sources:
             citations = "\n\n**Sources used:**\n" + "\n".join(
@@ -34,7 +37,7 @@ def chat(message: str, history: list) -> tuple[str, list]:
             )
             reply += citations
 
-        reply += f"\n\n*{turns_left} turns remaining in this session.*"
+        reply += f"\n\n*{turns_left} turns remaining · {tokens_used} tokens · ${cost_usd:.6f} this turn.*"
         history.append((message, reply))
         return "", history
     except Exception as e:
