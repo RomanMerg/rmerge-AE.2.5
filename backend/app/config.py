@@ -28,10 +28,6 @@ class Settings(BaseSettings):
     max_input_chars: int = 600
     max_output_tokens: int = 450
 
-    # Local dev Ollama
-    ollama_base_url: str = "http://localhost:11434"
-    ollama_embedding_model: str = "nomic-embed-text"
-
     # Twenty CRM (for capture_lead MCP tool)
     twenty_api_key: str = ""
     twenty_base_url: str = "http://localhost:3001"
