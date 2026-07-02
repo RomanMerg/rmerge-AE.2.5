@@ -2,11 +2,13 @@
 Gradio chat frontend for Automate This.
 Run with: uv run python frontend/app.py
 """
+import os
 import uuid
 import httpx
 import gradio as gr
 
-API_URL = "http://localhost:8000/chat"
+# Override with BACKEND_API_URL if port 8000 is already in use locally (e.g. `set BACKEND_API_URL=http://localhost:8001`)
+API_URL = os.getenv("BACKEND_API_URL", "http://localhost:8000") + "/chat"
 session_id = str(uuid.uuid4())
 
 
@@ -38,7 +40,8 @@ def chat(message: str, history: list) -> tuple[str, list]:
             reply += citations
 
         reply += f"\n\n*{turns_left} turns remaining · {tokens_used} tokens · ${cost_usd:.6f} this turn.*"
-        history.append((message, reply))
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": reply})
         return "", history
     except Exception as e:
         return f"Connection error: {e}", history
@@ -52,7 +55,7 @@ def new_conversation():
 
 with gr.Blocks(title="Automate This — SMB Advisor") as demo:
     gr.Markdown("# Automate This\nDescribe a repetitive task your business does manually. I'll tell you how to automate it.")
-    chatbot = gr.Chatbot(height=500)
+    chatbot = gr.Chatbot(height=500)  # this Gradio version (6.x) only supports the messages format
     msg = gr.Textbox(placeholder="e.g. I spend 3 hours a week chasing unpaid invoices by email...", label="Your message")
     clear = gr.Button("New conversation")
 
