@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     twenty_api_key: str = ""
     twenty_base_url: str = "http://localhost:3001"
 
+    # Anti-abuse: per-IP rate limiting on /chat
+    max_requests_per_ip_per_hour: int = 30
+
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",")]

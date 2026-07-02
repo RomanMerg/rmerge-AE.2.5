@@ -40,3 +40,13 @@ $$;
 CREATE OR REPLACE TRIGGER conversations_updated_at
     BEFORE UPDATE ON conversations
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Per-IP request logging for rate limiting on POST /chat
+CREATE TABLE IF NOT EXISTS chat_requests (
+    id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    ip_address TEXT        NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS chat_requests_ip_created_idx
+    ON chat_requests (ip_address, created_at);
