@@ -35,9 +35,19 @@ class Settings(BaseSettings):
     # Anti-abuse: per-IP rate limiting on /chat
     max_requests_per_ip_per_hour: int = 30
 
+    # Langfuse observability (optional — empty keys = tracing disabled)
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "https://cloud.langfuse.com"
+
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",")]
+
+    @property
+    def database_url_psycopg(self) -> str:
+        """Plain postgresql:// URL for psycopg3 (LangGraph checkpointer) — strips the SQLAlchemy asyncpg driver marker."""
+        return self.database_url.replace("postgresql+asyncpg://", "postgresql://")
 
 
 @lru_cache(maxsize=1)

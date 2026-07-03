@@ -70,3 +70,29 @@ def test_db_module_imports_and_engine_exists():
 
     assert engine is not None
     assert AsyncSessionLocal is not None
+
+
+def test_database_url_psycopg_strips_asyncpg_driver():
+    """AsyncPostgresSaver needs a plain postgresql:// URL (psycopg3), not the SQLAlchemy+asyncpg one."""
+    from app.config import Settings
+
+    s = Settings(
+        openrouter_api_key="k",
+        database_url="postgresql+asyncpg://user:pass@localhost:5432/db",
+        admin_api_key="a",
+    )
+    assert s.database_url_psycopg == "postgresql://user:pass@localhost:5432/db"
+
+
+def test_langfuse_settings_default_to_disabled():
+    """Without env vars, Langfuse keys default to empty strings (tracing disabled)."""
+    from app.config import Settings
+
+    s = Settings(
+        openrouter_api_key="k",
+        database_url="postgresql+asyncpg://u:p@h:5432/db",
+        admin_api_key="a",
+    )
+    assert s.langfuse_public_key == ""
+    assert s.langfuse_secret_key == ""
+    assert s.langfuse_host == "https://cloud.langfuse.com"
