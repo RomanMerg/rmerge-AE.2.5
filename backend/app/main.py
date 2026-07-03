@@ -228,40 +228,67 @@ async def chat_stream(body: ChatRequest, request: Request) -> StreamingResponse:
     async def event_stream():
         started = time.perf_counter()
         try:
-            async for chunk, metadata in graph.astream(
-                turn_input(body.message), config, stream_mode="messages"
-            ):
-                # Only surface assistant text (agent node); tool results and
-                # tool-call argument deltas are not user-facing tokens.
-                if metadata.get("langgraph_node") == "agent" and isinstance(chunk.content, str) and chunk.content:
-                    yield f"event: token\ndata: {json.dumps({'content': chunk.content})}\n\n"
+            try:
+                async for chunk, metadata in graph.astream(
+                    turn_input(body.message), config, stream_mode="messages"
+                ):
+                    # Only surface assistant text (agent node); tool results and
+                    # tool-call argument deltas are not user-facing tokens.
+                    if (
+                        metadata.get("langgraph_node") == "agent"
+                        and isinstance(chunk.content, str)
+                        and chunk.content
+                    ):
+                        yield f"event: token\ndata: {json.dumps({'content': chunk.content})}\n\n"
 
-            state = await graph.aget_state(config)
-            values = state.values
-            reply = values["messages"][-1].content or FALLBACK_REPLY
-            await _increment_turn(session_id)
+                state = await graph.aget_state(config)
+                values = state.values
+                reply = values["messages"][-1].content or FALLBACK_REPLY
+                await _increment_turn(session_id)
 
-            tokens_used = values["input_tokens"] + values["output_tokens"]
-            turns_remaining = settings.max_turns_per_session - (turn_count + 1)
-            logger.info(
-                "chat_turn",
-                session_id=session_id,
-                tools_called=values["tools_called"],
-                tokens_used=tokens_used,
-                cost_usd=round(values["cost_usd"], 6),
-                latency_ms=round((time.perf_counter() - started) * 1000),
-                turns_remaining=turns_remaining,
-                streamed=True,
-            )
-            payload = ChatResponse(
-                session_id=session_id,
-                reply=reply,
-                sources=values["sources"],
-                turns_remaining=turns_remaining,
-                tokens_used=tokens_used,
-                cost_usd=round(values["cost_usd"], 6),
-            ).model_dump()
-            yield f"event: done\ndata: {json.dumps(payload)}\n\n"
+                tokens_used = values["input_tokens"] + values["output_tokens"]
+                turns_remaining = settings.max_turns_per_session - (turn_count + 1)
+                logger.info(
+                    "chat_turn",
+                    session_id=session_id,
+                    tools_called=values["tools_called"],
+                    tokens_used=tokens_used,
+                    cost_usd=round(values["cost_usd"], 6),
+                    latency_ms=round((time.perf_counter() - started) * 1000),
+                    turns_remaining=turns_remaining,
+                    streamed=True,
+                )
+                payload = ChatResponse(
+                    session_id=session_id,
+                    reply=reply,
+                    sources=values["sources"],
+                    turns_remaining=turns_remaining,
+                    tokens_used=tokens_used,
+                    cost_usd=round(values["cost_usd"], 6),
+                ).model_dump()
+                yield f"event: done\ndata: {json.dumps(payload)}\n\n"
+            except GraphRecursionError:
+                await _increment_turn(session_id)
+                turns_remaining = settings.max_turns_per_session - (turn_count + 1)
+                logger.info(
+                    "chat_turn",
+                    session_id=session_id,
+                    tools_called=[],
+                    tokens_used=0,
+                    cost_usd=0.0,
+                    latency_ms=round((time.perf_counter() - started) * 1000),
+                    turns_remaining=turns_remaining,
+                    streamed=True,
+                )
+                payload = ChatResponse(
+                    session_id=session_id,
+                    reply=RECURSION_FALLBACK_REPLY,
+                    sources=[],
+                    turns_remaining=turns_remaining,
+                    tokens_used=0,
+                    cost_usd=0.0,
+                ).model_dump()
+                yield f"event: done\ndata: {json.dumps(payload)}\n\n"
         except Exception as e:  # noqa: BLE001 — stream is already open; must emit SSE, not raise
             logger.error("chat_stream_error", session_id=session_id, error=str(e))
             yield f"event: error\ndata: {json.dumps({'detail': 'The advisor hit a snag mid-reply — please retry.'})}\n\n"

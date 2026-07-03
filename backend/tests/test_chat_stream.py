@@ -121,3 +121,40 @@ async def test_stream_mid_stream_failure_emits_error_event():
     assert response.status_code == 200
     events = _parse_sse(response.text)
     assert events[-1][0] == "error"
+
+
+async def test_stream_recursion_limit_emits_done_with_fallback_reply():
+    """Recursion overflow must mirror /chat: graceful done event with the fallback
+    reply and a consumed turn — not a generic error event."""
+    from langchain_core.messages import AIMessage
+
+    from app.main import RECURSION_FALLBACK_REPLY
+
+    def _always_tool_call(*args, **kwargs):
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "calculate_roi",
+                "args": {"hours_saved_per_week": 1, "hourly_rate": 10, "setup_cost": 100},
+                "id": f"call_{uuid.uuid4().hex[:6]}",
+            }],
+            usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+
+    mock_session = _mock_db_session(row=None)
+    with (
+        patch("app.main.AsyncSessionLocal", return_value=mock_session),
+        patch("app.agent.ChatOpenAI") as mock_chat_cls,
+    ):
+        mock_chat_cls.return_value.bind_tools.return_value.ainvoke = AsyncMock(
+            side_effect=_always_tool_call
+        )
+        response = await _post_stream({"message": "loop forever"})
+
+    assert response.status_code == 200
+    events = _parse_sse(response.text)
+    assert [e for e, _ in events if e == "error"] == []
+    done_events = [d for e, d in events if e == "done"]
+    assert len(done_events) == 1
+    assert done_events[0]["reply"] == RECURSION_FALLBACK_REPLY
+    assert done_events[0]["tokens_used"] == 0
