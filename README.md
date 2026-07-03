@@ -217,9 +217,13 @@ curl -X POST "http://localhost:8000/admin/ingest?source=static" -H "X-Admin-Key:
 
 # Run the API
 cd backend
-uv run python -m uvicorn app.main:app --reload --port 8000
-# note: `uv run uvicorn ...` (without `python -m`) fails in some checkouts with a broken
-# trampoline path — use `uv run python -m uvicorn` if you hit that.
+uv run python run_server.py 8000
+# note: on Windows, plain uvicorn (`uv run python -m uvicorn app.main:app --port 8000`)
+# hangs at startup — its default ProactorEventLoop is rejected by psycopg's async pool
+# (used for the LangGraph Postgres checkpointer in app/main.py's lifespan). run_server.py
+# pins the selector event loop policy on win32 and drives uvicorn programmatically; on
+# Linux/macOS it behaves like plain uvicorn, so `uv run python -m uvicorn app.main:app
+# --reload --port 8000` still works fine there.
 
 # Run the Gradio demo (separate terminal)
 uv run python frontend/app.py
@@ -245,7 +249,7 @@ curl -X POST http://localhost:8000/chat \
 **Per-IP rate limit (30/hour)** — harder to trigger by hand in real time, since it's independent of `session_id`: clicking "New conversation" resets the turn counter but not the IP counter, so you'd need 31 real `/chat` calls (across any number of sessions) within an hour to see it fire naturally. The fast way to actually see the `429` while testing:
 
 1. Temporarily lower the limit for a quick test: add `MAX_REQUESTS_PER_IP_PER_HOUR=3` to `backend/.env`.
-2. Restart the server (`Ctrl+C`, re-run `uv run python -m uvicorn app.main:app --reload --port 8000`) — settings are cached per-process, so a running server won't pick up the change.
+2. Restart the server (`Ctrl+C`, re-run `uv run python run_server.py 8000`) — settings are cached per-process, so a running server won't pick up the change.
 3. Send 4 messages via the Gradio UI (clicking "New conversation" in between is fine — this limit doesn't care about `session_id`). The 4th should return `429` with detail `"Too many requests from this IP — try again later"`.
 4. Remove the override (or set it back to `30`) and restart the server again before real use.
 
