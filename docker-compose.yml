@@ -2,16 +2,16 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     environment:
-      POSTGRES_USER: automate
-      POSTGRES_PASSWORD: automate
-      POSTGRES_DB: automate_this
+      POSTGRES_USER: ${POSTGRES_USER:-automate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-automate}
+      POSTGRES_DB: ${POSTGRES_DB:-automate_this}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U automate -d automate_this"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-automate} -d ${POSTGRES_DB:-automate_this}"]
       interval: 5s
       timeout: 5s
       retries: 5
