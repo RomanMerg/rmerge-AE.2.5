@@ -1,28 +1,60 @@
-import json
+import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Literal
 
+import structlog
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.errors import GraphRecursionError
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel
 from sqlalchemy import text
 
+from app.agent import build_agent_graph, turn_input
 from app.config import get_settings
 from app.db import AsyncSessionLocal
+from app.logging_config import configure_logging
 from app.rag.ingest import ingest_static_kb
 from app.rag.live_ingester import ingest_live_docs
-from app.tools.roi import calculate_roi
-from app.tools.search import search_automation_patterns
-from mcp_server.server import capture_lead
 from app.rate_limit import check_ip_rate_limit, get_client_ip
-from app.cost_tracker import calculate_cost, estimate_embedding_tokens
+
+logger = structlog.get_logger()
+
+FALLBACK_REPLY = "Could you tell me more about what you're looking to automate?"
+RECURSION_FALLBACK_REPLY = (
+    "That one took more steps than I allow myself — could you rephrase or split the question?"
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup: logging + LangGraph Postgres checkpointer + compiled agent graph.
+    ASGITransport in unit tests never runs this — tests set app.state.agent_graph directly."""
+    configure_logging()
+    settings = get_settings()
+    pool = AsyncConnectionPool(
+        conninfo=settings.database_url_psycopg,
+        max_size=5,
+        open=False,
+        kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+    )
+    await pool.open()
+    checkpointer = AsyncPostgresSaver(pool)
+    await checkpointer.setup()  # idempotent — creates checkpoint tables on first run
+    app.state.agent_graph = build_agent_graph(checkpointer)
+    logger.info("startup_complete", checkpointer="AsyncPostgresSaver")
+    yield
+    await pool.close()
+
 
 app = FastAPI(
     title="Automate This API",
     description="SMB automation advisor — AI-powered consulting chatbot backend",
-    version="0.1.0",
+    version="0.2.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -77,89 +109,40 @@ class ChatResponse(BaseModel):
     cost_usd: float
 
 
-CALCULATE_ROI_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "calculate_roi",
-        "description": (
-            "Calculate the ROI of automating a manual task. Call this when the user states "
-            "how many hours per week a task takes and you know or can reasonably estimate "
-            "their hourly rate and a rough automation setup cost."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "hours_saved_per_week": {"type": "number", "description": "Hours per week the automation would save"},
-                "hourly_rate": {"type": "number", "description": "The business owner's hourly rate in EUR"},
-                "setup_cost": {"type": "number", "description": "One-time cost to build/set up the automation in EUR"},
-            },
-            "required": ["hours_saved_per_week", "hourly_rate", "setup_cost"],
-        },
-    },
-}
-
-SEARCH_AUTOMATION_PATTERNS_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "search_automation_patterns",
-        "description": (
-            "Search the knowledge base for automation patterns relevant to a task the user "
-            "described. Call this before recommending a specific automation approach so your "
-            "answer is grounded in real patterns rather than guessed."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "task_description": {
-                    "type": "string",
-                    "description": "The manual task or business process to find automation patterns for",
-                },
-            },
-            "required": ["task_description"],
-        },
-    },
-}
-
-CAPTURE_LEAD_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "capture_lead",
-        "description": (
-            "Save the user's contact details into the CRM so the team can follow up. "
-            "Only call this when the user has explicitly provided their name AND email."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Full name"},
-                "email": {"type": "string", "description": "Email address"},
-                "company": {"type": "string", "description": "Business name"},
-                "pain_point": {"type": "string", "description": "The automation problem they described"},
-            },
-            "required": ["name", "email", "company", "pain_point"],
-        },
-    },
-}
-
-SYSTEM_PROMPT = (
-    "You are 'Automate This', an SMB automation advisor. You have three tools available: "
-    "search_automation_patterns to ground your advice in real automation patterns, "
-    "calculate_roi to estimate payback time and savings once you know hours saved, hourly "
-    "rate, and setup cost, and capture_lead to save the user's contact details once they've "
-    "explicitly given you their name AND email. Be concrete: name the tools, estimate hours "
-    "saved per week, and suggest a first step the business owner can take today."
-)
+async def _get_or_create_turn_count(session_id: str) -> int:
+    async with AsyncSessionLocal() as session:
+        row = (
+            await session.execute(
+                text("SELECT turn_count FROM conversations WHERE session_id = :sid"),
+                {"sid": session_id},
+            )
+        ).fetchone()
+        if row is None:
+            await session.execute(
+                text("INSERT INTO conversations (session_id, turn_count, history) VALUES (:sid, 0, '[]')"),
+                {"sid": session_id},
+            )
+            await session.commit()
+            return 0
+        return row.turn_count
 
 
-def _usage_tokens(ai_message) -> tuple[int, int]:
-    """Extract (input_tokens, output_tokens) from an AIMessage's usage_metadata, defaulting to 0."""
-    usage = getattr(ai_message, "usage_metadata", None) or {}
-    return usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+async def _increment_turn(session_id: str) -> None:
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            text(
+                "UPDATE conversations SET turn_count = turn_count + 1, "
+                "updated_at = NOW() WHERE session_id = :sid"
+            ),
+            {"sid": session_id},
+        )
+        await session.commit()
 
 
 @app.post("/chat", tags=["chat"])
 async def chat(body: ChatRequest, request: Request) -> ChatResponse:
-    """Multi-turn chat with tool calling (search_automation_patterns, calculate_roi, capture_lead) via LangChain."""
+    """Multi-turn chat via the LangGraph agent. History lives in LangGraph
+    checkpoints (thread_id = session_id); conversations table only counts turns."""
     settings = get_settings()
 
     if len(body.message) > settings.max_input_chars:
@@ -168,106 +151,45 @@ async def chat(body: ChatRequest, request: Request) -> ChatResponse:
     await check_ip_rate_limit(get_client_ip(request))
 
     session_id = body.session_id or str(uuid.uuid4())
-    async with AsyncSessionLocal() as session:
-        row = (
-            await session.execute(
-                text("SELECT turn_count, history FROM conversations WHERE session_id = :sid"),
-                {"sid": session_id},
-            )
-        ).fetchone()
-
-        if row is None:
-            turn_count = 0
-            history = []
-            await session.execute(
-                text("INSERT INTO conversations (session_id, turn_count, history) VALUES (:sid, 0, '[]')"),
-                {"sid": session_id},
-            )
-            await session.commit()
-        else:
-            turn_count = row.turn_count
-            history = row.history  # already a list (asyncpg deserialises JSONB)
-
+    turn_count = await _get_or_create_turn_count(session_id)
     if turn_count >= settings.max_turns_per_session:
         raise HTTPException(429, "Session turn limit reached")
 
-    llm = ChatOpenAI(
-        model=settings.chat_model,
-        api_key=settings.openrouter_api_key,
-        base_url=settings.openrouter_base_url,
-        max_tokens=settings.max_output_tokens,
-    ).bind_tools([CALCULATE_ROI_TOOL, SEARCH_AUTOMATION_PATTERNS_TOOL, CAPTURE_LEAD_TOOL])
+    graph = app.state.agent_graph
+    config = {
+        "configurable": {"thread_id": session_id},
+        "recursion_limit": 10,
+        "metadata": {"langfuse_session_id": session_id},
+    }
 
-    messages = [SystemMessage(content=SYSTEM_PROMPT)]
-    for turn in history:
-        if turn["role"] == "user":
-            messages.append(HumanMessage(content=turn["content"]))
-        else:
-            messages.append(AIMessage(content=turn["content"]))
-    messages.append(HumanMessage(content=body.message))
+    started = time.perf_counter()
+    try:
+        result = await graph.ainvoke(turn_input(body.message), config)
+        reply = result["messages"][-1].content or FALLBACK_REPLY
+    except GraphRecursionError:
+        result = {"sources": [], "tools_called": [], "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+        reply = RECURSION_FALLBACK_REPLY
+    latency_ms = round((time.perf_counter() - started) * 1000)
 
-    ai_message = await llm.ainvoke(messages)
-    sources: list[dict] = []
-    total_input_tokens, total_output_tokens = _usage_tokens(ai_message)
-    total_cost = calculate_cost(settings.chat_model, total_input_tokens, total_output_tokens)
+    await _increment_turn(session_id)
 
-    if ai_message.tool_calls:
-        messages.append(ai_message)
-        for tool_call in ai_message.tool_calls:
-            tool_name = tool_call["name"]
-            tool_args = tool_call["args"]
-
-            try:
-                if tool_name == "calculate_roi":
-                    tool_result = calculate_roi(**tool_args)
-                elif tool_name == "search_automation_patterns":
-                    search_result = await search_automation_patterns(**tool_args)
-                    sources = search_result["sources"]
-                    tool_result = search_result["formatted"]
-                    embedding_tokens = estimate_embedding_tokens(tool_args.get("task_description", ""))
-                    total_input_tokens += embedding_tokens
-                    total_cost += calculate_cost(settings.embedding_model, embedding_tokens, 0)
-                elif tool_name == "capture_lead":
-                    tool_result = await capture_lead(**tool_args)
-                else:
-                    tool_result = {"status": "error", "detail": f"Unknown tool {tool_name}"}
-            except Exception as e:
-                # A malformed tool call (e.g. a missing/None required arg from the LLM) must
-                # not 500 the whole request — feed the error back so the LLM can recover.
-                tool_result = {"status": "error", "detail": f"{tool_name} failed: {e}"}
-
-            messages.append(
-                ToolMessage(content=json.dumps(tool_result), tool_call_id=tool_call["id"])
-            )
-
-        final_message = await llm.ainvoke(messages)
-        reply = final_message.content or "I've made a note of that — could you tell me more?"
-        final_in, final_out = _usage_tokens(final_message)
-        total_input_tokens += final_in
-        total_output_tokens += final_out
-        total_cost += calculate_cost(settings.chat_model, final_in, final_out)
-    else:
-        reply = ai_message.content or "Could you tell me more about what you're looking to automate?"
-
-    new_history = history + [
-        {"role": "user", "content": body.message},
-        {"role": "assistant", "content": reply},
-    ]
-    async with AsyncSessionLocal() as session:
-        await session.execute(
-            text(
-                "UPDATE conversations SET turn_count = turn_count + 1, "
-                "history = CAST(:history AS jsonb) WHERE session_id = :sid"
-            ),
-            {"history": json.dumps(new_history), "sid": session_id},
-        )
-        await session.commit()
+    tokens_used = result["input_tokens"] + result["output_tokens"]
+    turns_remaining = settings.max_turns_per_session - (turn_count + 1)
+    logger.info(
+        "chat_turn",
+        session_id=session_id,
+        tools_called=result["tools_called"],
+        tokens_used=tokens_used,
+        cost_usd=round(result["cost_usd"], 6),
+        latency_ms=latency_ms,
+        turns_remaining=turns_remaining,
+    )
 
     return ChatResponse(
         session_id=session_id,
         reply=reply,
-        sources=sources,
-        turns_remaining=settings.max_turns_per_session - (turn_count + 1),
-        tokens_used=total_input_tokens + total_output_tokens,
-        cost_usd=round(total_cost, 6),
+        sources=result["sources"],
+        turns_remaining=turns_remaining,
+        tokens_used=tokens_used,
+        cost_usd=round(result["cost_usd"], 6),
     )
