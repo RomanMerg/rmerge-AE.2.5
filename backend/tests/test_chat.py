@@ -377,3 +377,28 @@ async def test_chat_tokens_used_includes_embedding_estimate_when_search_called()
     data = response.json()
     # 30+5 (first call) + 60+20 (second call) + estimate_embedding_tokens("x"*40)=10
     assert data["tokens_used"] == 30 + 5 + 60 + 20 + 10
+
+
+@pytest.mark.asyncio
+async def test_chat_malformed_tool_args_returns_200_not_500():
+    """A tool call with a missing/None required argument must not 500 the whole request —
+    reproduces a real bug found live: the LLM omitted hourly_rate, calculate_roi(**tool_args)
+    raised TypeError, and it propagated as an unhandled 500 all the way to the client."""
+    mock_session = _mock_db_session(row=None)
+    tool_call = {
+        "name": "calculate_roi",
+        "args": {"hours_saved_per_week": 3, "hourly_rate": None, "setup_cost": 200},
+        "id": "call_bad",
+    }
+    first_msg = _make_ai_message(content=None, tool_calls=[tool_call])
+    second_msg = _make_ai_message(content="Could you share your hourly rate so I can calculate that?")
+
+    with (
+        patch("app.main.AsyncSessionLocal", return_value=mock_session),
+        patch("app.main.ChatOpenAI") as mock_chat_cls,
+    ):
+        _configure_mock_llm(mock_chat_cls, [first_msg, second_msg])
+        response = await _post_chat({"message": "I spend 3 hours a week on social media posts"})
+
+    assert response.status_code == 200
+    assert response.json()["reply"] != ""

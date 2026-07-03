@@ -217,19 +217,24 @@ async def chat(body: ChatRequest, request: Request) -> ChatResponse:
             tool_name = tool_call["name"]
             tool_args = tool_call["args"]
 
-            if tool_name == "calculate_roi":
-                tool_result = calculate_roi(**tool_args)
-            elif tool_name == "search_automation_patterns":
-                search_result = await search_automation_patterns(**tool_args)
-                sources = search_result["sources"]
-                tool_result = search_result["formatted"]
-                embedding_tokens = estimate_embedding_tokens(tool_args.get("task_description", ""))
-                total_input_tokens += embedding_tokens
-                total_cost += calculate_cost(settings.embedding_model, embedding_tokens, 0)
-            elif tool_name == "capture_lead":
-                tool_result = await capture_lead(**tool_args)
-            else:
-                tool_result = {"status": "error", "detail": f"Unknown tool {tool_name}"}
+            try:
+                if tool_name == "calculate_roi":
+                    tool_result = calculate_roi(**tool_args)
+                elif tool_name == "search_automation_patterns":
+                    search_result = await search_automation_patterns(**tool_args)
+                    sources = search_result["sources"]
+                    tool_result = search_result["formatted"]
+                    embedding_tokens = estimate_embedding_tokens(tool_args.get("task_description", ""))
+                    total_input_tokens += embedding_tokens
+                    total_cost += calculate_cost(settings.embedding_model, embedding_tokens, 0)
+                elif tool_name == "capture_lead":
+                    tool_result = await capture_lead(**tool_args)
+                else:
+                    tool_result = {"status": "error", "detail": f"Unknown tool {tool_name}"}
+            except Exception as e:
+                # A malformed tool call (e.g. a missing/None required arg from the LLM) must
+                # not 500 the whole request — feed the error back so the LLM can recover.
+                tool_result = {"status": "error", "detail": f"{tool_name} failed: {e}"}
 
             messages.append(
                 ToolMessage(content=json.dumps(tool_result), tool_call_id=tool_call["id"])
