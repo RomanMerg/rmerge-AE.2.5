@@ -45,6 +45,3 @@ chroma_db/
 
 # Claude Code session-local settings
 .claude/
-
-# Competitor analyses — 2026-07-03 file is tracked (force-added); future ones stay local by default
-docs/competitor-analysis-*.md
