@@ -17,6 +17,7 @@ from app.agent import build_agent_graph, turn_input
 from app.config import get_settings
 from app.db import AsyncSessionLocal
 from app.logging_config import configure_logging
+from app.observability import get_langfuse_callbacks
 from app.rag.ingest import ingest_static_kb
 from app.rag.live_ingester import ingest_live_docs
 from app.rate_limit import check_ip_rate_limit, get_client_ip
@@ -159,6 +160,7 @@ async def chat(body: ChatRequest, request: Request) -> ChatResponse:
     config = {
         "configurable": {"thread_id": session_id},
         "recursion_limit": 10,
+        "callbacks": get_langfuse_callbacks(),
         "metadata": {"langfuse_session_id": session_id},
     }
 
