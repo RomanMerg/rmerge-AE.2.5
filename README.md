@@ -11,8 +11,9 @@ A domain-specialised AI chatbot built for Turing College Sprint 2 (Building Appl
 1. **Grounded advice** — `POST /chat` runs a session/turn-managed conversation. The LLM decides when to call `search_automation_patterns`, which retrieves the most relevant automation patterns from pgvector (curated knowledge base + live-refreshed tool documentation) rather than hallucinating a workflow.
 2. **ROI on demand** — once the user gives hours saved/week, hourly rate, and a rough setup cost, `calculate_roi` (pure, deterministic Python — no LLM cost) returns annual savings, payback period, 3-year net savings, and an automate/borderline/not-worth-it recommendation.
 3. **Lead capture** — once the user has explicitly given a name and email, `capture_lead` (a standalone FastMCP tool server) creates a Person record in Twenty CRM and attaches a note with their stated pain point — real REST API calls verified against a live Twenty CRM instance, not mocked.
-4. **Rate-limited, stateless-server sessions** — 8 turns per `session_id` AND 30 requests per IP per hour (independent of `session_id`, closing the session-cycling bypass), full history persisted to PostgreSQL as JSONB, 429 once either limit is hit.
-5. **Demo UI** — a Gradio chat interface for manual testing and the Sprint 2 submission demo (the planned production frontend is Next.js, built separately once UI design work happens — see [Roadmap](#roadmap--known-gaps)).
+4. **Rate-limited, stateless-server sessions** — 8 turns per `session_id` AND 30 requests per IP per hour (independent of `session_id`, closing the session-cycling bypass); conversation history now lives in LangGraph's Postgres checkpointer (thread_id = session_id), 429 once either limit is hit.
+5. **Streaming replies** — `POST /chat/stream` runs the same LangGraph agent but streams the reply as Server-Sent Events (`token` events as the LLM generates, then one `done` event with the full response payload) — the transport the Next.js frontend will consume.
+6. **Demo UI** — a Gradio chat interface for manual testing and the Sprint 2 submission demo (the planned production frontend is Next.js, built separately once UI design work happens — see [Roadmap](#roadmap--known-gaps)).
 
 ---
 
@@ -20,17 +21,19 @@ A domain-specialised AI chatbot built for Turing College Sprint 2 (Building Appl
 
 | Component | Choice | Rationale |
 |---|---|---|
-| API | FastAPI (async) | `/chat`, `/health`, `/admin/ingest` |
-| LLM orchestration | LangChain (`langchain-openai` `ChatOpenAI`) | Bound to 3 raw OpenAI-format tool schemas; bounded 2-call tool loop, no `AgentExecutor` |
+| API | FastAPI (async) | `/chat`, `/chat/stream`, `/health`, `/admin/ingest` |
+| LLM orchestration | LangGraph (explicit `StateGraph` agent) + `langchain-openai` `ChatOpenAI` | Multi-step tool loop with a recursion limit (10), not a fixed 2-call loop or `AgentExecutor` |
 | LLM | `openai/gpt-4o-mini` via OpenRouter | Mandatory OpenAI-compatible SDK requirement |
 | Embeddings | `text-embedding-3-small` via OpenRouter (1536-dim) | Matches the `VECTOR(1536)` schema |
 | Vector store | pgvector (PostgreSQL 16, ivfflat index) | Cosine similarity search over curated + live docs |
 | Tool protocol | FastMCP | `capture_lead` is a real MCP tool server, callable standalone (`fastmcp run`) or imported in-process by `/chat` |
 | CRM | Twenty CRM (self-hosted, REST API) | Lead storage — Person + linked Note per capture |
 | ORM | SQLAlchemy async + asyncpg, raw `text()` SQL | No ORM models — explicit SQL throughout |
+| Observability | Langfuse (env-gated) + structlog JSON logs | `chat_turn` structured log per request; Langfuse traces when keys are set, clean no-op otherwise |
+| Memory | LangGraph `AsyncPostgresSaver` checkpoints (thread_id = session_id) | Conversation history lives in LangGraph's own Postgres tables, not `conversations.history` |
 | Demo UI | Gradio | Fast, disposable Sprint 2 demo harness |
 | Package manager | uv | No `pip install` anywhere in the project |
-| Tests | pytest-asyncio | 88 unit + 3 integration (91 total) |
+| Tests | pytest-asyncio | 110 unit + 3 integration (113 total) |
 
 ---
 
@@ -58,7 +61,7 @@ All three are bound to a single `ChatOpenAI` client as raw `{"type": "function",
 | Domain specialisation, focused KB | ✅ | SMB automation consulting; 6 curated pattern files + live n8n/Twenty/Make/Zapier/Lovable docs |
 | Proper error handling | ✅ | Empty-LLM-reply fallback, `capture_lead` never raises (isolates person-creation success from note/link failure), `AsyncSessionLocal` scoped per request |
 | Input validation, rate limiting, API key management | ✅ | `max_input_chars` → 422, `max_turns_per_session` → 429, `X-Admin-Key` on `/admin/ingest`, all secrets via `.env` / `get_settings()` (never `os.getenv` bypasses) |
-| Logging and monitoring | ⚠️ Partial | Uvicorn access logs only — structured per-request logging (session_id, tools called, tokens, cost) is planned but not yet built |
+| Logging and monitoring | ✅ | Structured `chat_turn` JSON log per request (structlog: session_id, tools called, tokens, cost, latency) + Langfuse LLM traces (env-gated) |
 | UI — Streamlit/Next.js | ⚠️ Substituted | Built with **Gradio** (sprint doc's own accepted "Python Track: Alternative") as a fast, disposable demo harness. Production Next.js frontend is a deliberately separate, later build — see [Roadmap](#roadmap--known-gaps) |
 | Show context/sources, display tool results | ✅ | Gradio renders source citations with similarity scores per reply |
 | Progress indicators for long operations | ⬜ Not done | |
@@ -129,6 +132,8 @@ CREATE TABLE chat_requests (
 
 > **Existing running Postgres containers** (e.g. from an earlier session) won't pick up `chat_requests` automatically — `init.sql` only runs on first container creation. Apply it manually against a live DB: `CREATE TABLE IF NOT EXISTS chat_requests (...)` from `init.sql`, then the matching index.
 
+**`conversations.history` is no longer written.** Conversation history now lives in LangGraph's own checkpoint tables (`checkpoints`, `checkpoint_blobs`, `checkpoint_writes` — plus `checkpoint_migrations`), auto-created by `AsyncPostgresSaver.setup()` on every app startup (idempotent). `conversations` is kept only for `turn_count` (the per-session rate limit) and for backward compatibility with the `history` column shape; nothing reads it anymore. Sessions created before this change keep their old JSONB history in `conversations.history`, but that history is **not** migrated into a LangGraph checkpoint — the first post-migration turn in an old session starts with no memory of what came before. This is a dev-only environment with no real users yet, so the gap is accepted rather than fixed with a migration script.
+
 ---
 
 ## API Endpoints
@@ -137,7 +142,8 @@ CREATE TABLE chat_requests (
 |---|---|---|---|
 | GET | `/health` | None | Uptime check |
 | POST | `/admin/ingest` | `X-Admin-Key` | Ingest KB into pgvector — `?source=static` (6 curated files) or `?source=live` (n8n/Twenty/Make/Zapier/Lovable docs) |
-| POST | `/chat` | None | Session-managed, tool-calling chat. Request: `{session_id?, message}`. Response: `{session_id, reply, sources, turns_remaining, tokens_used, cost_usd}`. `429` on either the per-session turn limit or the per-IP hourly rate limit, distinguished by the `detail` message |
+| POST | `/chat` | None | Session-managed, tool-calling chat via the LangGraph agent. Request: `{session_id?, message}`. Response: `{session_id, reply, sources, turns_remaining, tokens_used, cost_usd}`. `429` on either the per-session turn limit or the per-IP hourly rate limit, distinguished by the `detail` message |
+| POST | `/chat/stream` | None | Same request body as `/chat`. Rejection paths (422 message-too-long, 429 rate limits) fire as plain HTTP errors **before** the stream opens. Once open, response is `text/event-stream` SSE: zero or more `event: token` frames (`data: {"content": "..."}` — one per LLM text delta from the agent node only, not tool-call argument deltas), then exactly one terminal frame — either `event: done` (`data:` = the same JSON shape as `/chat`'s response body) or, if the turn fails mid-stream, `event: error` (`data: {"detail": "..."}`) |
 
 ---
 
@@ -153,6 +159,24 @@ Six curated automation patterns in `backend/knowledge_base/`, each with manual t
 - **Social Media Scheduling** — content queue and multi-platform posting
 
 Supplemented by live-fetched documentation (n8n, Twenty CRM, Make.com, Zapier, Lovable) — same table, `metadata.source = "live"`, indistinguishable to `search_automation_patterns` beyond the metadata tag.
+
+---
+
+## Observability
+
+**Structured logs** — every `/chat` and `/chat/stream` call emits one `chat_turn` JSON log line via `structlog` (configured in `app/logging_config.py`), regardless of whether Langfuse is configured:
+
+```json
+{"session_id": "...", "tools_called": ["search_automation_patterns", "calculate_roi"], "tokens_used": 3378, "cost_usd": 0.000712, "latency_ms": 12963, "turns_remaining": 7, "event": "chat_turn", "level": "info", "timestamp": "2026-07-03T11:55:16.015003Z"}
+```
+
+`/chat/stream`'s version of this line adds `"streamed": true`. A `startup_complete` line is also logged once, on app boot, after the LangGraph checkpointer's tables are created.
+
+**Langfuse tracing** — optional and env-gated (`app/observability.py`). Leave `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` blank in `.env` and tracing is a clean no-op (`get_langfuse_callbacks()` returns `[]`, no warnings, no errors). To enable:
+
+1. Create a free project at [cloud.langfuse.com](https://cloud.langfuse.com) → Settings → API Keys.
+2. Set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and (if self-hosting Langfuse) `LANGFUSE_HOST` in `backend/.env`.
+3. Restart the server. Every graph invocation now runs with a `langfuse.langchain.CallbackHandler` in its LangChain callbacks, and `metadata.langfuse_session_id` is set to the chat `session_id`, so traces are filterable per conversation in the Langfuse dashboard.
 
 ---
 
@@ -232,7 +256,7 @@ curl -X POST http://localhost:8000/chat \
 ```bash
 cd backend
 
-# Unit tests only (no DB required) — 88 tests
+# Unit tests only (no DB required) — 110 tests
 uv run python -m pytest -m "not integration"
 
 # Integration tests (requires live Postgres with pgvector) — 3 tests
@@ -249,9 +273,12 @@ uv run python -m pytest -m integration -v
 rmerge-AE.2.5/
 ├── backend/
 │   ├── app/
-│   │   ├── main.py              # FastAPI app: /health, /admin/ingest, /chat (LangChain tool-calling loop)
+│   │   ├── main.py              # FastAPI app: /health, /admin/ingest, /chat, /chat/stream (LangGraph agent)
+│   │   ├── agent.py             # build_agent_graph() — explicit StateGraph tool loop, per-turn state reset
 │   │   ├── config.py            # Pydantic Settings — every credential goes through get_settings()
 │   │   ├── db.py                # Async SQLAlchemy engine + session factory
+│   │   ├── logging_config.py    # structlog JSON configuration
+│   │   ├── observability.py     # get_langfuse_callbacks() — env-gated Langfuse tracing
 │   │   ├── rate_limit.py        # get_client_ip(), check_ip_rate_limit() — per-IP hourly cap, Postgres-backed
 │   │   ├── cost_tracker.py      # calculate_cost(), estimate_embedding_tokens(), MODEL_PRICING
 │   │   ├── rag/
@@ -264,7 +291,7 @@ rmerge-AE.2.5/
 │   ├── mcp_server/
 │   │   └── server.py            # FastMCP capture_lead — real Twenty CRM /rest/ API calls
 │   ├── knowledge_base/          # 6 curated automation pattern markdown files
-│   └── tests/                   # 88 unit + 3 integration (pytest-asyncio, asyncio_mode=auto)
+│   └── tests/                   # 110 unit + 3 integration (pytest-asyncio, asyncio_mode=auto)
 ├── frontend/
 │   └── app.py                   # Gradio chat demo — disposable Sprint 2 harness
 ├── docs/
@@ -282,8 +309,8 @@ rmerge-AE.2.5/
 
 Documented honestly rather than glossed over:
 
-- **Structured logging** (session_id, tools called, tokens, cost per request) — planned, not built. Currently just uvicorn access logs.
-- **Production frontend (Next.js)** — deliberately deferred to its own design + build session; Gradio is explicitly a throwaway demo, not competing with this plan.
+- **Sprint 3 (next up):** long-term memory (beyond per-thread checkpoints — e.g. user-level facts persisted across sessions), a `suggest_tool_stack` tool, and the Next.js frontend, per a separate Phase 2 plan.
+- **Production frontend (Next.js)** — deliberately deferred to its own design + build session; Gradio is explicitly a throwaway demo, not competing with this plan. `/chat/stream` (SSE) exists specifically as the transport it will consume.
 - **2 Medium + 1 Hard optional tasks done** — real-time KB updates, MCP-server tools, and token/cost tracking. Still short of the stretch goal of adding more (e.g. conversation export, multi-model support) if pursued further.
 - **`live_ingester.py` is manually triggered**, not on a schedule — "automated KB updates" (Hard optional) isn't fully satisfied.
 - **No intent/jailbreak guard** on chat input beyond length validation and the LLM's own tool-call judgment — a stricter security posture would add a dedicated input classifier, as this project's Sprint 1 predecessor did.
