@@ -222,8 +222,10 @@ uv run python run_server.py 8000
 # hangs at startup — its default ProactorEventLoop is rejected by psycopg's async pool
 # (used for the LangGraph Postgres checkpointer in app/main.py's lifespan). run_server.py
 # pins the selector event loop policy on win32 and drives uvicorn programmatically; on
-# Linux/macOS it behaves like plain uvicorn, so `uv run python -m uvicorn app.main:app
-# --reload --port 8000` still works fine there.
+# Linux/macOS it behaves like plain uvicorn. Hot-reload is not supported by this launcher
+# on Windows (restart manually after code changes; Linux/macOS can still use plain
+# `uv run python -m uvicorn app.main:app --reload --port 8000`). A DeprecationWarning
+# about WindowsSelectorEventLoopPolicy at startup is expected and harmless.
 
 # Run the Gradio demo (separate terminal)
 uv run python frontend/app.py

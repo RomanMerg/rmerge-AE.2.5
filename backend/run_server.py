@@ -5,6 +5,13 @@ async pool (used by the LangGraph Postgres checkpointer in app.main's lifespan)
 refuses to run under. This launcher pins the selector policy on win32 and drives
 uvicorn programmatically; on Linux/macOS it behaves like plain uvicorn.
 
+Hot-reload is not supported: uvicorn's `--reload` supervisor spawns worker processes
+that recreate the Proactor loop before this policy fix can apply, so restart manually
+after code changes. Linux/macOS users can keep using plain `uvicorn --reload`.
+
+On newer Python versions a `DeprecationWarning` about `WindowsSelectorEventLoopPolicy`
+appears at startup — this is expected and harmless.
+
 Usage: uv run python run_server.py [PORT]   (default 8000)
 """
 
