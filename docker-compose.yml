@@ -6,7 +6,10 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-automate}
       POSTGRES_DB: ${POSTGRES_DB:-automate_this}
     ports:
-      - "5432:5432"
+      # Host port 5433: 5432 is typically held by another local Postgres (e.g. the
+      # Twenty CRM stack's twenty-db-1). Point DATABASE_URL at localhost:5433 to use
+      # this container, or at your existing 5432 server with a dedicated database.
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql

@@ -186,11 +186,16 @@ Supplemented by live-fetched documentation (n8n, Twenty CRM, Make.com, Zapier, L
 |---|---|---|
 | FastAPI backend | localhost | 8000 (or next free port — Twenty CRM and other local services may already occupy 8000) |
 | Gradio demo UI | localhost | 7860 |
-| PostgreSQL + pgvector | localhost | 5432 |
+| PostgreSQL + pgvector | localhost | 5432 (existing shared server) or 5433 (this repo's compose container) |
 | Twenty CRM | localhost | 3001 |
 | OpenRouter API | openrouter.ai | 443 |
 
-Postgres runs via `docker-compose.yml`; Twenty CRM runs as a separately-managed local instance (not part of this repo's compose stack).
+Two equally valid Postgres setups — pick one and set `DATABASE_URL` accordingly:
+
+- **Shared existing server (current dev setup):** a dedicated database on an already-running Postgres server (here: the Twenty CRM stack's `twenty-db-1` on 5432, which happens to ship pgvector). Zero extra containers. Trade-off: this project's data rides that container's lifecycle — recreating the Twenty stack has wiped the ingested KB once before, and would now also take the LangGraph checkpoints and rate-limit log with it.
+- **This repo's compose container (clean-room / reviewer setup):** `docker compose up -d` starts a self-contained pgvector Postgres on host port **5433** (5432 is usually taken by the shared server above), with `init.sql` applied on first start.
+
+Twenty CRM runs as a separately-managed local instance (not part of this repo's compose stack).
 
 ---
 
@@ -208,9 +213,11 @@ uv sync
 cp .env.example .env
 # Fill in OPENROUTER_API_KEY, DATABASE_URL, ADMIN_API_KEY, TWENTY_API_KEY, TWENTY_BASE_URL
 
-# Start Postgres (from repo root)
+# Start Postgres (from repo root) — skip if using an existing Postgres server
 cd ..
 docker compose up -d
+# The compose container listens on host port 5433 — use
+# DATABASE_URL=postgresql+asyncpg://automate:automate@localhost:5433/automate_this
 
 # Ingest the knowledge base
 curl -X POST "http://localhost:8000/admin/ingest?source=static" -H "X-Admin-Key: your_admin_key"
