@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 import uuid
@@ -17,7 +18,7 @@ from sqlalchemy import text
 
 from app.agent import build_agent_graph, turn_input
 from app.config import get_settings
-from app.db import AsyncSessionLocal
+from app.db import AsyncSessionLocal, engine
 from app.logging_config import configure_logging
 from app.observability import get_langfuse_callbacks
 from app.rag.ingest import ingest_static_kb
@@ -30,6 +31,12 @@ FALLBACK_REPLY = "Could you tell me more about what you're looking to automate?"
 RECURSION_FALLBACK_REPLY = (
     "That one took more steps than I allow myself — could you rephrase or split the question?"
 )
+
+# Must stay EVEN: overflow then always lands right after the tools node (the
+# thread's last message is a ToolMessage), never leaving a dangling
+# AIMessage(tool_calls) on the checkpoint — which would poison every
+# subsequent turn on the thread with an OpenAI 400 (unresolved tool call).
+RECURSION_LIMIT = 10
 
 
 @asynccontextmanager
@@ -51,6 +58,7 @@ async def lifespan(app: FastAPI):
     logger.info("startup_complete", checkpointer="AsyncPostgresSaver")
     yield
     await pool.close()
+    await engine.dispose()
 
 
 app = FastAPI(
@@ -161,7 +169,7 @@ async def chat(body: ChatRequest, request: Request) -> ChatResponse:
     graph = app.state.agent_graph
     config = {
         "configurable": {"thread_id": session_id},
-        "recursion_limit": 10,
+        "recursion_limit": RECURSION_LIMIT,
         "callbacks": get_langfuse_callbacks(),
         "metadata": {"langfuse_session_id": session_id},
     }
@@ -171,7 +179,19 @@ async def chat(body: ChatRequest, request: Request) -> ChatResponse:
         result = await graph.ainvoke(turn_input(body.message), config)
         reply = result["messages"][-1].content or FALLBACK_REPLY
     except GraphRecursionError:
-        result = {"sources": [], "tools_called": [], "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+        # The graph still checkpointed this turn's real spend (a recursion
+        # overflow is ~5 LLM calls — the most expensive turn possible), so
+        # read the true accumulated counters from the persisted state rather
+        # than fabricating zeros.
+        state = await graph.aget_state(config)
+        values = state.values
+        result = {
+            "sources": values.get("sources", []),
+            "tools_called": values.get("tools_called", []),
+            "input_tokens": values.get("input_tokens", 0),
+            "output_tokens": values.get("output_tokens", 0),
+            "cost_usd": values.get("cost_usd", 0.0),
+        }
         reply = RECURSION_FALLBACK_REPLY
     latency_ms = round((time.perf_counter() - started) * 1000)
 
@@ -220,18 +240,26 @@ async def chat_stream(body: ChatRequest, request: Request) -> StreamingResponse:
     graph = app.state.agent_graph
     config = {
         "configurable": {"thread_id": session_id},
-        "recursion_limit": 10,
+        "recursion_limit": RECURSION_LIMIT,
         "callbacks": get_langfuse_callbacks(),
         "metadata": {"langfuse_session_id": session_id},
     }
 
     async def event_stream():
         started = time.perf_counter()
+        # work_started: graph.astream began yielding (LLM spend may have happened,
+        # and the checkpointer may have persisted the turn) — a disconnect after
+        # this point must still consume the turn. turn_counted: guards against
+        # double-counting between the normal path, the recursion path, and the
+        # cancellation path.
+        work_started = False
+        turn_counted = False
         try:
             try:
                 async for chunk, metadata in graph.astream(
                     turn_input(body.message), config, stream_mode="messages"
                 ):
+                    work_started = True
                     # Only surface assistant text (agent node); tool results and
                     # tool-call argument deltas are not user-facing tokens.
                     if (
@@ -245,6 +273,7 @@ async def chat_stream(body: ChatRequest, request: Request) -> StreamingResponse:
                 values = state.values
                 reply = values["messages"][-1].content or FALLBACK_REPLY
                 await _increment_turn(session_id)
+                turn_counted = True
 
                 tokens_used = values["input_tokens"] + values["output_tokens"]
                 turns_remaining = settings.max_turns_per_session - (turn_count + 1)
@@ -268,14 +297,26 @@ async def chat_stream(body: ChatRequest, request: Request) -> StreamingResponse:
                 ).model_dump()
                 yield f"event: done\ndata: {json.dumps(payload)}\n\n"
             except GraphRecursionError:
+                # The graph still checkpointed this turn's real spend (a recursion
+                # overflow is ~5 LLM calls — the most expensive turn possible), so
+                # read the true accumulated counters from the persisted state
+                # rather than fabricating zeros.
+                state = await graph.aget_state(config)
+                values = state.values
+                sources = values.get("sources", [])
+                tools_called = values.get("tools_called", [])
+                tokens_used = values.get("input_tokens", 0) + values.get("output_tokens", 0)
+                cost_usd = values.get("cost_usd", 0.0)
+
                 await _increment_turn(session_id)
+                turn_counted = True
                 turns_remaining = settings.max_turns_per_session - (turn_count + 1)
                 logger.info(
                     "chat_turn",
                     session_id=session_id,
-                    tools_called=[],
-                    tokens_used=0,
-                    cost_usd=0.0,
+                    tools_called=tools_called,
+                    tokens_used=tokens_used,
+                    cost_usd=round(cost_usd, 6),
                     latency_ms=round((time.perf_counter() - started) * 1000),
                     turns_remaining=turns_remaining,
                     streamed=True,
@@ -283,12 +324,25 @@ async def chat_stream(body: ChatRequest, request: Request) -> StreamingResponse:
                 payload = ChatResponse(
                     session_id=session_id,
                     reply=RECURSION_FALLBACK_REPLY,
-                    sources=[],
+                    sources=sources,
                     turns_remaining=turns_remaining,
-                    tokens_used=0,
-                    cost_usd=0.0,
+                    tokens_used=tokens_used,
+                    cost_usd=round(cost_usd, 6),
                 ).model_dump()
                 yield f"event: done\ndata: {json.dumps(payload)}\n\n"
+        except (asyncio.CancelledError, GeneratorExit):
+            # Client disconnected mid-stream. Under a real ASGI server the
+            # request task is cancelled (asyncio.CancelledError); calling
+            # aclose() directly on the generator (as in tests, or some ASGI
+            # transports) raises GeneratorExit instead. Either way, if graph
+            # work had already started, spend happened and the checkpointer
+            # already persisted the turn — so the turn must still be counted,
+            # even though we can't emit any more SSE events on a closed
+            # connection. Must re-raise: swallowing it here would leave the
+            # generator (and task) in an inconsistent state.
+            if work_started and not turn_counted:
+                await _increment_turn(session_id)
+            raise
         except Exception as e:  # noqa: BLE001 — stream is already open; must emit SSE, not raise
             logger.error("chat_stream_error", session_id=session_id, error=str(e))
             yield f"event: error\ndata: {json.dumps({'detail': 'The advisor hit a snag mid-reply — please retry.'})}\n\n"

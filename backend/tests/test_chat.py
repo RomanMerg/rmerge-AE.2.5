@@ -424,6 +424,40 @@ async def test_chat_malformed_tool_args_returns_200_not_500():
 
 
 @pytest.mark.asyncio
+async def test_chat_recursion_limit_returns_fallback_reply_with_real_tokens():
+    """Recursion overflow must still report the turn's real accumulated spend —
+    the graph checkpointed ~5 LLM calls' worth of tokens/cost before the recursion
+    limit fired, so tokens_used must not be fabricated as 0."""
+    from app.main import RECURSION_FALLBACK_REPLY
+
+    def _always_tool_call(*args, **kwargs):
+        return _make_ai_message(
+            content="",
+            tool_calls=[{
+                "name": "calculate_roi",
+                "args": {"hours_saved_per_week": 1, "hourly_rate": 10, "setup_cost": 100},
+                "id": f"call_{uuid.uuid4().hex[:6]}",
+            }],
+            usage_metadata={"input_tokens": 1, "output_tokens": 1},
+        )
+
+    mock_session = _mock_db_session(row=None)
+    with (
+        patch("app.main.AsyncSessionLocal", return_value=mock_session),
+        patch("app.agent.ChatOpenAI") as mock_chat_cls,
+    ):
+        mock_chat_cls.return_value.bind_tools.return_value.ainvoke = AsyncMock(
+            side_effect=_always_tool_call
+        )
+        response = await _post_chat({"message": "loop forever"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["reply"] == RECURSION_FALLBACK_REPLY
+    assert data["tokens_used"] > 0
+
+
+@pytest.mark.asyncio
 async def test_chat_emits_structured_chat_turn_log():
     """Every successful /chat emits one structured chat_turn event with the key request facts."""
     import structlog

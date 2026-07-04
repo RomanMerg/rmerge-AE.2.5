@@ -2,6 +2,7 @@
 that streams content word-by-word) so LangGraph's stream_mode='messages' has
 real token callbacks to surface — a MagicMock LLM can't emit those."""
 
+import asyncio
 import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,10 +11,11 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from starlette.requests import Request
 
 from app.agent import build_agent_graph
 from app.config import get_settings
-from app.main import app
+from app.main import app, chat_stream, ChatRequest
 
 
 def _mock_db_session(row=None):
@@ -157,4 +159,63 @@ async def test_stream_recursion_limit_emits_done_with_fallback_reply():
     done_events = [d for e, d in events if e == "done"]
     assert len(done_events) == 1
     assert done_events[0]["reply"] == RECURSION_FALLBACK_REPLY
-    assert done_events[0]["tokens_used"] == 0
+    # The graph checkpointed real spend before the recursion limit was hit —
+    # a recursion overflow is ~5 LLM calls, the most expensive turn possible —
+    # so the fallback must report the true accumulated counters, not zero.
+    assert done_events[0]["tokens_used"] > 0
+
+
+def _make_request() -> Request:
+    """Minimal ASGI scope for calling the endpoint function directly — bypasses
+    ASGITransport, which buffers the whole response and can't simulate a
+    genuine mid-stream disconnect (there's no live connection to sever)."""
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/chat/stream",
+        "headers": [],
+        "query_string": b"",
+        "client": ("testclient", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+    }
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    return Request(scope, receive=receive)
+
+
+async def test_stream_client_disconnect_mid_stream_still_counts_the_turn():
+    """A client that disconnects after graph work has started (LLM spend
+    happened, the checkpointer already persisted the turn) must still have
+    its turn counted — otherwise history can grow past the turn limit on a
+    flaky connection. Drives the StreamingResponse's body_iterator directly
+    and closes it mid-stream (aclose() throws GeneratorExit into the
+    generator at its current await/yield, the same shape asyncio.CancelledError
+    takes on a real ASGI disconnect) since ASGITransport can't simulate this."""
+    with (
+        patch("app.main.check_ip_rate_limit", new=AsyncMock()),
+        patch("app.main.AsyncSessionLocal", return_value=_mock_db_session(row=None)),
+        patch("app.main._increment_turn", new=AsyncMock()) as mock_increment,
+        patch("app.agent.ChatOpenAI") as mock_chat_cls,
+    ):
+        mock_chat_cls.return_value.bind_tools.return_value = _fake_streaming_llm(
+            "Automate your invoicing with n8n and a follow-up sequence."
+        )
+        body = ChatRequest(message="help me automate invoicing")
+        response = await chat_stream(body, _make_request())
+
+        agen = response.body_iterator
+        # Consume the first chunk so graph work has definitely started. Then
+        # simulate what a real ASGI server does on client disconnect: the task
+        # driving this generator is cancelled, i.e. asyncio.CancelledError is
+        # thrown in at the generator's current suspension point — not
+        # GeneratorExit (that's what aclose() sends, and it's a different
+        # exception the handler doesn't catch, so athrow() is used instead to
+        # match production behavior exactly).
+        await agen.__anext__()
+        with pytest.raises(asyncio.CancelledError):
+            await agen.athrow(asyncio.CancelledError())
+
+    mock_increment.assert_awaited_once()
