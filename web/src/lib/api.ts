@@ -73,6 +73,7 @@ export async function streamChat(
       const { done, value } = await reader.read();
       if (done) break;
       for (const ev of parser.push(decoder.decode(value, { stream: true }))) {
+        if (terminal) break;
         if (ev.event === "token") {
           handlers.onToken((JSON.parse(ev.data) as { content: string }).content);
         } else if (ev.event === "done") {
@@ -81,14 +82,16 @@ export async function streamChat(
         } else if (ev.event === "error") {
           terminal = true;
           handlers.onError((JSON.parse(ev.data) as { detail: string }).detail);
-          return;
         }
       }
+      if (terminal) break;
     }
     if (!terminal) {
       handlers.onError("The reply was cut off — please retry.");
     }
   } catch {
-    handlers.onError("Connection lost mid-reply — please retry.");
+    if (!terminal) handlers.onError("Connection lost mid-reply — please retry.");
+  } finally {
+    if (terminal) void reader.cancel().catch(() => {});
   }
 }

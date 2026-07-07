@@ -115,3 +115,44 @@ test("stream ending without a done event is reported as an error", async () => {
   expect(calls.tokens).toEqual(["partial"]);
   expect(calls.errors).toHaveLength(1);
 });
+
+test("reader failure after the done event does not also fire onError", async () => {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(
+        encoder.encode(`event: done\ndata: ${JSON.stringify(DONE_PAYLOAD)}\n\n`),
+      );
+      // Defer the error to a macrotask so the reader's first read() resolves
+      // with the "done" chunk before the second read() rejects — mirrors a
+      // real server closing the connection right after the final frame.
+      setTimeout(() => controller.error(new Error("connection reset")), 0);
+    },
+  });
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
+  );
+  const { calls, handlers } = collectHandlers();
+
+  await streamChat("hi", "s-1", handlers, "http://api.test");
+
+  expect(calls.done).toEqual([DONE_PAYLOAD]);
+  expect(calls.errors).toEqual([]);
+});
+
+test("events after done are ignored", async () => {
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    sseResponse([
+      `event: done\ndata: ${JSON.stringify(DONE_PAYLOAD)}\n\n`,
+      'event: token\ndata: {"content": "stray"}\n\n',
+      `event: done\ndata: ${JSON.stringify(DONE_PAYLOAD)}\n\n`,
+    ]),
+  );
+  const { calls, handlers } = collectHandlers();
+
+  await streamChat("hi", "s-1", handlers, "http://api.test");
+
+  expect(calls.done).toHaveLength(1);
+  expect(calls.tokens).toEqual([]);
+  expect(calls.errors).toEqual([]);
+});
