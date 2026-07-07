@@ -77,11 +77,13 @@ export async function streamChat(
         if (ev.event === "token") {
           handlers.onToken((JSON.parse(ev.data) as { content: string }).content);
         } else if (ev.event === "done") {
+          const payload = JSON.parse(ev.data) as ChatDone;
           terminal = true;
-          handlers.onDone(JSON.parse(ev.data) as ChatDone);
+          handlers.onDone(payload);
         } else if (ev.event === "error") {
+          const detail = (JSON.parse(ev.data) as { detail: string }).detail;
           terminal = true;
-          handlers.onError((JSON.parse(ev.data) as { detail: string }).detail);
+          handlers.onError(detail);
         }
       }
       if (terminal) break;

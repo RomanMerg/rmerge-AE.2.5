@@ -140,6 +140,18 @@ test("reader failure after the done event does not also fire onError", async () 
   expect(calls.errors).toEqual([]);
 });
 
+test("malformed done payload still fires exactly one onError", async () => {
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    sseResponse(["event: done\ndata: not-json\n\n"]),
+  );
+  const { calls, handlers } = collectHandlers();
+
+  await streamChat("hi", "s-1", handlers, "http://api.test");
+
+  expect(calls.done).toEqual([]);
+  expect(calls.errors).toHaveLength(1);
+});
+
 test("events after done are ignored", async () => {
   vi.spyOn(globalThis, "fetch").mockResolvedValue(
     sseResponse([

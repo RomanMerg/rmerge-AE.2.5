@@ -94,17 +94,29 @@ test("onError sets error, clears the streaming bubble, keeps the user message", 
 
 test("send is a no-op while already streaming or for blank input", async () => {
   let capturedHandlers: StreamHandlers | undefined;
-  streamChatMock.mockImplementation(async (_m, _s, handlers) => {
-    capturedHandlers = handlers; // never terminates -> stays streaming
-  });
+  let resolveStream: () => void = () => {};
+  // Mirrors the real streamChat contract: the returned promise stays pending
+  // until a terminal callback fires — it never resolves "silently".
+  streamChatMock.mockImplementation(
+    (_m, _s, handlers) =>
+      new Promise<void>((resolve) => {
+        capturedHandlers = handlers;
+        resolveStream = resolve;
+      }),
+  );
   const { result } = renderHook(() => useChat());
 
-  await act(() => result.current.send("first"));
-  expect(result.current.isStreaming).toBe(true);
+  act(() => {
+    void result.current.send("first");
+  });
+  await waitFor(() => expect(result.current.isStreaming).toBe(true));
   await act(() => result.current.send("second while busy"));
   expect(streamChatMock).toHaveBeenCalledTimes(1);
 
-  act(() => capturedHandlers!.onDone(DONE));
+  act(() => {
+    capturedHandlers!.onDone(DONE);
+    resolveStream();
+  });
   await waitFor(() => expect(result.current.isStreaming).toBe(false));
 
   await act(() => result.current.send("   "));
@@ -121,6 +133,29 @@ test("newConversation clears messages, error, session id, and resets turns", asy
 
   expect(result.current.messages).toEqual([]);
   expect(result.current.error).toBeNull();
+  expect(result.current.turnsRemaining).toBe(MAX_TURNS);
+  expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+});
+
+test("newConversation mid-stream orphans the old stream's callbacks", async () => {
+  let captured: StreamHandlers | undefined;
+  streamChatMock.mockImplementation(async (_m, _s, handlers) => {
+    captured = handlers; // stream stays in flight
+  });
+  const { result } = renderHook(() => useChat());
+  await act(() => result.current.send("first question"));
+  expect(result.current.isStreaming).toBe(true);
+
+  act(() => result.current.newConversation());
+
+  // stale callbacks fire after the reset — all must be ignored
+  act(() => {
+    captured!.onToken("zombie tokens");
+    captured!.onDone(DONE);
+  });
+
+  expect(result.current.messages).toEqual([]);
+  expect(result.current.streamingReply).toBeNull();
   expect(result.current.turnsRemaining).toBe(MAX_TURNS);
   expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
 });

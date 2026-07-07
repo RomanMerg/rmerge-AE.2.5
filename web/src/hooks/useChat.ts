@@ -21,6 +21,7 @@ export function useChat() {
   const [turnsRemaining, setTurnsRemaining] = useState(MAX_TURNS);
   const [error, setError] = useState<string | null>(null);
   const streamingRef = useRef(false);
+  const genRef = useRef(0);
 
   const isStreaming = streamingReply !== null;
 
@@ -29,42 +30,53 @@ export function useChat() {
       const trimmed = text.trim();
       if (!trimmed || streamingRef.current) return;
       streamingRef.current = true;
+      const gen = ++genRef.current;
 
       setError(null);
       setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
       setStreamingReply("");
 
       const sessionId = sessionStorage.getItem(SESSION_KEY);
-      await streamChat(trimmed, sessionId, {
-        onToken: (content) => setStreamingReply((prev) => (prev ?? "") + content),
-        onDone: (done) => {
-          sessionStorage.setItem(SESSION_KEY, done.session_id);
-          setMessages((prev) => [
-            ...prev,
-            {
-              role: "assistant",
-              content: done.reply,
-              sources: done.sources,
-              tokensUsed: done.tokens_used,
-              costUsd: done.cost_usd,
-            },
-          ]);
-          setTurnsRemaining(done.turns_remaining);
-          streamingRef.current = false;
-          setStreamingReply(null);
-        },
-        onError: (message) => {
-          setError(message);
-          streamingRef.current = false;
-          setStreamingReply(null);
-        },
-      });
+      try {
+        await streamChat(trimmed, sessionId, {
+          onToken: (content) => {
+            if (genRef.current !== gen) return;
+            setStreamingReply((prev) => (prev ?? "") + content);
+          },
+          onDone: (done) => {
+            if (genRef.current !== gen) return;
+            sessionStorage.setItem(SESSION_KEY, done.session_id);
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                content: done.reply,
+                sources: done.sources,
+                tokensUsed: done.tokens_used,
+                costUsd: done.cost_usd,
+              },
+            ]);
+            setTurnsRemaining(done.turns_remaining);
+            streamingRef.current = false;
+            setStreamingReply(null);
+          },
+          onError: (message) => {
+            if (genRef.current !== gen) return;
+            setError(message);
+            streamingRef.current = false;
+            setStreamingReply(null);
+          },
+        });
+      } finally {
+        if (genRef.current === gen) streamingRef.current = false;
+      }
     },
     [],
   );
 
   const newConversation = useCallback(() => {
     sessionStorage.removeItem(SESSION_KEY);
+    genRef.current += 1;
     setMessages([]);
     setError(null);
     setTurnsRemaining(MAX_TURNS);
