@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { type Source, streamChat } from "@/lib/api";
 
 export const MAX_TURNS = 8;
@@ -20,13 +20,15 @@ export function useChat() {
   const [streamingReply, setStreamingReply] = useState<string | null>(null);
   const [turnsRemaining, setTurnsRemaining] = useState(MAX_TURNS);
   const [error, setError] = useState<string | null>(null);
+  const streamingRef = useRef(false);
 
   const isStreaming = streamingReply !== null;
 
   const send = useCallback(
     async (text: string) => {
       const trimmed = text.trim();
-      if (!trimmed || isStreaming) return;
+      if (!trimmed || streamingRef.current) return;
+      streamingRef.current = true;
 
       setError(null);
       setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
@@ -48,15 +50,17 @@ export function useChat() {
             },
           ]);
           setTurnsRemaining(done.turns_remaining);
+          streamingRef.current = false;
           setStreamingReply(null);
         },
         onError: (message) => {
           setError(message);
+          streamingRef.current = false;
           setStreamingReply(null);
         },
       });
     },
-    [isStreaming],
+    [],
   );
 
   const newConversation = useCallback(() => {
@@ -64,6 +68,7 @@ export function useChat() {
     setMessages([]);
     setError(null);
     setTurnsRemaining(MAX_TURNS);
+    streamingRef.current = false;
     setStreamingReply(null);
   }, []);
 

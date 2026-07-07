@@ -124,3 +124,21 @@ test("newConversation clears messages, error, session id, and resets turns", asy
   expect(result.current.turnsRemaining).toBe(MAX_TURNS);
   expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
 });
+
+test("two same-tick sends only fire streamChat once", async () => {
+  let captured: StreamHandlers | undefined;
+  streamChatMock.mockImplementation(async (_m, _s, handlers) => {
+    captured = handlers;
+  });
+  const { result } = renderHook(() => useChat());
+
+  await act(async () => {
+    void result.current.send("first");
+    void result.current.send("second same tick");
+  });
+
+  expect(streamChatMock).toHaveBeenCalledTimes(1);
+  expect(result.current.messages).toEqual([{ role: "user", content: "first" }]);
+
+  act(() => captured!.onDone(DONE));
+});
