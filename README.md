@@ -13,7 +13,7 @@ A domain-specialised AI chatbot built for Turing College Sprint 2 (Building Appl
 3. **Lead capture** — once the user has explicitly given a name and email, `capture_lead` (a standalone FastMCP tool server) creates a Person record in Twenty CRM and attaches a note with their stated pain point — real REST API calls verified against a live Twenty CRM instance, not mocked.
 4. **Rate-limited, stateless-server sessions** — 8 turns per `session_id` AND 30 requests per IP per hour (independent of `session_id`, closing the session-cycling bypass); conversation history now lives in LangGraph's Postgres checkpointer (thread_id = session_id), 429 once either limit is hit.
 5. **Streaming replies** — `POST /chat/stream` runs the same LangGraph agent but streams the reply as Server-Sent Events (`token` events as the LLM generates, then one `done` event with the full response payload) — the transport the Next.js frontend will consume.
-6. **Demo UI** — a Gradio chat interface for manual testing and the Sprint 2 submission demo (the planned production frontend is Next.js, built separately once UI design work happens — see [Roadmap](#roadmap--known-gaps)).
+6. **Demo UI** — a Gradio chat interface for manual testing and the Sprint 2 submission demo. Interactive use is now superseded by the functional Next.js app in `web/` (Gradio kept as a minimal harness).
 
 ---
 
@@ -185,6 +185,7 @@ Supplemented by live-fetched documentation (n8n, Twenty CRM, Make.com, Zapier, L
 | Service | Host | Port |
 |---|---|---|
 | FastAPI backend | localhost | 8000 (or next free port — Twenty CRM and other local services may already occupy 8000) |
+| Next.js frontend | localhost | 3000 |
 | Gradio demo UI | localhost | 7860 |
 | PostgreSQL + pgvector | localhost | 5432 (existing shared server) or 5433 (this repo's compose container) |
 | Twenty CRM | localhost | 3001 |
@@ -305,6 +306,8 @@ rmerge-AE.2.5/
 │   │   └── server.py            # FastMCP capture_lead — real Twenty CRM /rest/ API calls
 │   ├── knowledge_base/          # 6 curated automation pattern markdown files
 │   └── tests/                   # 110 unit + 3 integration (pytest-asyncio, asyncio_mode=auto)
+├── web/
+│   └── README.md                # Next.js 15 chat UI consuming /chat/stream from the backend
 ├── frontend/
 │   └── app.py                   # Gradio chat demo — disposable Sprint 2 harness
 ├── docs/
@@ -322,8 +325,8 @@ rmerge-AE.2.5/
 
 Documented honestly rather than glossed over:
 
-- **Sprint 3 (next up):** long-term memory (beyond per-thread checkpoints — e.g. user-level facts persisted across sessions), a `suggest_tool_stack` tool, and the Next.js frontend, per a separate Phase 2 plan.
-- **Production frontend (Next.js)** — deliberately deferred to its own design + build session; Gradio is explicitly a throwaway demo, not competing with this plan. `/chat/stream` (SSE) exists specifically as the transport it will consume.
+- **Sprint 3 (next up):** long-term memory (beyond per-thread checkpoints — e.g. user-level facts persisted across sessions), a `suggest_tool_stack` tool, and visual design polish for the Next.js frontend, per a separate Phase 2 plan.
+- **Functional Next.js frontend built in `web/`** — streams from `/chat/stream`, manages session/turn state, shows sources + token/cost, and enforces the 8-turn limit. Visual design pass (spec Section 13 brief) still pending.
 - **2 Medium + 1 Hard optional tasks done** — real-time KB updates, MCP-server tools, and token/cost tracking. Still short of the stretch goal of adding more (e.g. conversation export, multi-model support) if pursued further.
 - **`live_ingester.py` is manually triggered**, not on a schedule — "automated KB updates" (Hard optional) isn't fully satisfied.
 - **No intent/jailbreak guard** on chat input beyond length validation and the LLM's own tool-call judgment — a stricter security posture would add a dedicated input classifier, as this project's Sprint 1 predecessor did.
